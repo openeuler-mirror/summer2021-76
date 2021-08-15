@@ -1,9 +1,13 @@
 /*
- * Copyright (C) 2012 Fusion-io
+ * block queue tracing parse application
  *
- *  This program is free software; you can redistribute it and/or
- *  modify it under the terms of the GNU General Public
- *  License v2 as published by the Free Software Foundation.
+ * Copyright (C) 2005 Jens Axboe <axboe@suse.de>
+ * Copyright (C) 2006 Jens Axboe <axboe@kernel.dk>
+ *
+ *  This program is free software; you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation; either version 2 of the License, or
+ *  (at your option) any later version.
  *
  *  This program is distributed in the hope that it will be useful,
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -12,1207 +16,3190 @@
  *
  *  You should have received a copy of the GNU General Public License
  *  along with this program; if not, write to the Free Software
- *  Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ *  Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
- *  Parts of this file were imported from Jens Axboe's blktrace sources (also GPL)
  */
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <fcntl.h>
 #include <unistd.h>
-#include <stdlib.h>
 #include <stdio.h>
-#include <math.h>
-#include <inttypes.h>
+#include <fcntl.h>
+#include <stdlib.h>
+#include <stdarg.h>
 #include <string.h>
-#include <asm/types.h>
+#include <getopt.h>
 #include <errno.h>
-#include <sys/mman.h>
+#include <signal.h>
+#include <locale.h>
+#include <libgen.h>
 #include <time.h>
-#include <math.h>
-#include <dirent.h>
 
-//#include "plot.h"
+#include "blktrace.h"
+#include "rbtree.h"
+#include "jhash.h"
 #include "blkparse.h"
-#include "list.h"
-#include "tracers.h"
 
-#define IO_HASH_TABLE_BITS  11
-#define IO_HASH_TABLE_SIZE (1 << IO_HASH_TABLE_BITS)
-static struct list_head io_hash_table[IO_HASH_TABLE_SIZE];
-static u64 ios_in_flight = 0;
+static char blkparse_version[] = "1.3.0";
 
-#define PROCESS_HASH_TABLE_BITS 7
-#define PROCESS_HASH_TABLE_SIZE (1 << PROCESS_HASH_TABLE_BITS)
-static struct list_head process_hash_table[PROCESS_HASH_TABLE_SIZE];
+struct skip_info {
+	unsigned long start, end;
+	struct skip_info *prev, *next;
+};
 
-extern int plot_io_action;
-extern int io_per_process;
+
 
 /*
- * Trace categories
+ * some duplicated effort here, we can unify this hash and the ppi hash later
  */
+struct process_pid_map {
+	pid_t pid;
+	char comm[16];
+	struct process_pid_map *hash_next, *list_next;
+};
+
+#define PPM_HASH_SHIFT	(8)
+#define PPM_HASH_SIZE	(1 << PPM_HASH_SHIFT)
+#define PPM_HASH_MASK	(PPM_HASH_SIZE - 1)
+static struct process_pid_map *ppm_hash_table[PPM_HASH_SIZE];
+
+struct per_process_info {
+	struct process_pid_map *ppm;
+	struct io_stats io_stats;
+	struct per_process_info *hash_next, *list_next;
+	int more_than_one;
+
+	/*
+	 * individual io stats
+	 */
+	unsigned long long longest_allocation_wait[2];
+	unsigned long long longest_dispatch_wait[2];
+	unsigned long long longest_completion_wait[2];
+};
+
+#define PPI_HASH_SHIFT	(8)
+#define PPI_HASH_SIZE	(1 << PPI_HASH_SHIFT)
+#define PPI_HASH_MASK	(PPI_HASH_SIZE - 1)
+
 enum {
-	BLK_TC_READ	= 1 << 0,	/* reads */
-	BLK_TC_WRITE	= 1 << 1,	/* writes */
-	BLK_TC_FLUSH	= 1 << 2,	/* flush */
-	BLK_TC_SYNC	= 1 << 3,	/* sync */
-	BLK_TC_QUEUE	= 1 << 4,	/* queueing/merging */
-	BLK_TC_REQUEUE	= 1 << 5,	/* requeueing */
-	BLK_TC_ISSUE	= 1 << 6,	/* issue */
-	BLK_TC_COMPLETE	= 1 << 7,	/* completions */
-	BLK_TC_FS	= 1 << 8,	/* fs requests */
-	BLK_TC_PC	= 1 << 9,	/* pc requests */
-	BLK_TC_NOTIFY	= 1 << 10,	/* special message */
-	BLK_TC_AHEAD	= 1 << 11,	/* readahead */
-	BLK_TC_META	= 1 << 12,	/* metadata */
-	BLK_TC_DISCARD	= 1 << 13,	/* discard requests */
-	BLK_TC_DRV_DATA	= 1 << 14,	/* binary driver data */
-	BLK_TC_FUA	= 1 << 15,	/* fua requests */
-
-	BLK_TC_END	= 1 << 15,	/* we've run out of bits! */
+	SORT_PROG_EVENT_N,   /* Program Name */
+	SORT_PROG_EVENT_QKB, /* KB: Queued read and write */
+	SORT_PROG_EVENT_RKB, /* KB: Queued Read */
+	SORT_PROG_EVENT_WKB, /* KB: Queued Write */
+	SORT_PROG_EVENT_CKB, /* KB: Complete */
+	SORT_PROG_EVENT_QIO, /* IO: Queued read and write */
+	SORT_PROG_EVENT_RIO, /* IO: Queued Read */
+	SORT_PROG_EVENT_WIO, /* IO: Queued Write */
+	SORT_PROG_EVENT_CIO, /* IO: Complete */
 };
 
-#define BLK_TC_SHIFT		(16)
-#define BLK_TC_ACT(act)		((act) << BLK_TC_SHIFT)
-#define BLK_DATADIR(a) (((a) >> BLK_TC_SHIFT) & (BLK_TC_READ | BLK_TC_WRITE))
+static struct per_process_info *ppi_hash_table[PPI_HASH_SIZE];
+static struct per_process_info *ppi_list;
+static int ppi_list_entries;
+
+static struct option l_opts[] = {
+ 	{
+		.name = "act-mask",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'a'
+	},
+	{
+		.name = "set-mask",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'A'
+	},
+	{
+		.name = "batch",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'b'
+	},
+	{
+		.name = "input-directory",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'D'
+	},
+	{
+		.name = "dump-binary",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'd'
+	},
+	{
+		.name = "format",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'f'
+	},
+	{
+		.name = "format-spec",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'F'
+	},
+	{
+		.name = "hash-by-name",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 'h'
+	},
+	{
+		.name = "input",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'i'
+	},
+	{
+		.name = "no-msgs",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 'M'
+	},
+	{
+		.name = "output",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'o'
+	},
+	{
+		.name = "no-text-output",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 'O'
+	},
+	{
+		.name = "quiet",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 'q'
+	},
+	{
+		.name = "per-program-stats",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 's'
+	},
+	{
+		.name = "sort-program-stats",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'S'
+	},
+	{
+		.name = "track-ios",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 't'
+	},
+	{
+		.name = "stopwatch",
+		.has_arg = required_argument,
+		.flag = NULL,
+		.val = 'w'
+	},
+	{
+		.name = "verbose",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 'v'
+	},
+	{
+		.name = "version",
+		.has_arg = no_argument,
+		.flag = NULL,
+		.val = 'V'
+	},
+	{
+		.name = NULL,
+	}
+};
 
 /*
- * Basic trace actions
+ * for sorting the displayed output
  */
-enum {
-	__BLK_TA_QUEUE = 1,		/* queued */
-	__BLK_TA_BACKMERGE,		/* back merged to existing rq */
-	__BLK_TA_FRONTMERGE,		/* front merge to existing rq */
-	__BLK_TA_GETRQ,			/* allocated new request */
-	__BLK_TA_SLEEPRQ,		/* sleeping on rq allocation */
-	__BLK_TA_REQUEUE,		/* request requeued */
-	__BLK_TA_ISSUE,			/* sent to driver */
-	__BLK_TA_COMPLETE,		/* completed by driver */
-	__BLK_TA_PLUG,			/* queue was plugged */
-	__BLK_TA_UNPLUG_IO,		/* queue was unplugged by io */
-	__BLK_TA_UNPLUG_TIMER,		/* queue was unplugged by timer */
-	__BLK_TA_INSERT,		/* insert request */
-	__BLK_TA_SPLIT,			/* bio was split */
-	__BLK_TA_BOUNCE,		/* bio was bounced */
-	__BLK_TA_REMAP,			/* bio was remapped */
-	__BLK_TA_ABORT,			/* request aborted */
-	__BLK_TA_DRV_DATA,		/* binary driver data */
+struct trace {
+	struct blk_io_trace *bit;
+	struct rb_node rb_node;
+	struct trace *next;
+	unsigned long read_sequence;
 };
 
-#define BLK_TA_MASK ((1 << BLK_TC_SHIFT) - 1)
+static struct rb_root rb_sort_root;
+static unsigned long rb_sort_entries;
+
+static struct trace *trace_list;
 
 /*
- * Notify events.
+ * allocation cache
  */
-enum blktrace_notify {
-	__BLK_TN_PROCESS = 0,		/* establish pid/name mapping */
-	__BLK_TN_TIMESTAMP,		/* include system clock */
-	__BLK_TN_MESSAGE,               /* Character string message */
-};
+static struct blk_io_trace *bit_alloc_list;
+static struct trace *t_alloc_list;
 
 /*
- * Trace actions in full. Additionally, read or write is masked
+ * for tracking individual ios
  */
-#define BLK_TA_QUEUE		(__BLK_TA_QUEUE | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_BACKMERGE	(__BLK_TA_BACKMERGE | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_FRONTMERGE	(__BLK_TA_FRONTMERGE | BLK_TC_ACT(BLK_TC_QUEUE))
-#define	BLK_TA_GETRQ		(__BLK_TA_GETRQ | BLK_TC_ACT(BLK_TC_QUEUE))
-#define	BLK_TA_SLEEPRQ		(__BLK_TA_SLEEPRQ | BLK_TC_ACT(BLK_TC_QUEUE))
-#define	BLK_TA_REQUEUE		(__BLK_TA_REQUEUE | BLK_TC_ACT(BLK_TC_REQUEUE))
-#define BLK_TA_ISSUE		(__BLK_TA_ISSUE | BLK_TC_ACT(BLK_TC_ISSUE))
-#define BLK_TA_COMPLETE		(__BLK_TA_COMPLETE| BLK_TC_ACT(BLK_TC_COMPLETE))
-#define BLK_TA_PLUG		(__BLK_TA_PLUG | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_UNPLUG_IO	(__BLK_TA_UNPLUG_IO | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_UNPLUG_TIMER	(__BLK_TA_UNPLUG_TIMER | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_INSERT		(__BLK_TA_INSERT | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_SPLIT		(__BLK_TA_SPLIT)
-#define BLK_TA_BOUNCE		(__BLK_TA_BOUNCE)
-#define BLK_TA_REMAP		(__BLK_TA_REMAP | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_ABORT		(__BLK_TA_ABORT | BLK_TC_ACT(BLK_TC_QUEUE))
-#define BLK_TA_DRV_DATA		(__BLK_TA_DRV_DATA | BLK_TC_ACT(BLK_TC_DRV_DATA))
-
-#define BLK_TN_PROCESS		(__BLK_TN_PROCESS | BLK_TC_ACT(BLK_TC_NOTIFY))
-#define BLK_TN_TIMESTAMP	(__BLK_TN_TIMESTAMP | BLK_TC_ACT(BLK_TC_NOTIFY))
-#define BLK_TN_MESSAGE		(__BLK_TN_MESSAGE | BLK_TC_ACT(BLK_TC_NOTIFY))
-
-#define BLK_IO_TRACE_MAGIC	0x65617400
-#define BLK_IO_TRACE_VERSION	0x07
-/*
- * The trace itself
- */
-struct blk_io_trace {
-	__u32 magic;		/* MAGIC << 8 | version */
-	__u32 sequence;		/* event number */
-	__u64 time;		/* in nanoseconds */
-	__u64 sector;		/* disk offset */
-	__u32 bytes;		/* transfer length */
-	__u32 action;		/* what happened */
-	__u32 pid;		/* who did it */
-	__u32 device;		/* device identifier (dev_t) */
-	__u32 cpu;		/* on what cpu did it happen */
-	__u16 error;		/* completion error */
-	__u16 pdu_len;		/* length of data after this trace */
+struct io_track_req {
+	struct process_pid_map *ppm;
+	unsigned long long allocation_time;
+	unsigned long long queue_time;
+	unsigned long long dispatch_time;
+	unsigned long long completion_time;
 };
 
-struct graph_line_data {
-	/* beginning of an interval displayed by this graph */
-	unsigned int min_seconds;
-
-	/* end of an interval displayed by this graph */
-	unsigned int max_seconds;
-
-	unsigned int stop_seconds;
-
-	/* Y max */
-	u64 max;
-
-	/* label for this graph */
-	char *label;
-	struct graph_line_pair data[];
+struct io_track {
+	struct rb_node rb_node;
+	struct io_track_req *req;
+	struct io_track *next;
+	__u64 sector;
 };
 
-struct graph_line_pair {
-	u64 count;
-	u64 sum;
-};
+static int ndevices;
+static struct per_dev_info *devices;
+static char *get_dev_name(struct per_dev_info *, char *, int);
+static int trace_rb_insert_last(struct per_dev_info *, struct trace *);
 
-struct pending_io {
-	/* sector offset of this IO */
-	u64 sector;
+FILE *ofp = NULL;
+static char *output_name;
+static char *input_dir;
 
-	/* dev_t for this IO */
-	u32 device;
+static unsigned long long genesis_time;
+static unsigned long long last_allowed_time;
+static unsigned long long stopwatch_start;	/* start from zero by default */
+static unsigned long long stopwatch_end = -1ULL;	/* "infinity" */
+static unsigned long read_sequence;
 
-	/* time this IO was dispatched */
-	u64 dispatch_time;
-	/* time this IO was finished */
-	u64 completion_time;
-	struct list_head hash_list;
-	/* process which queued this IO */
-	u32 pid;
-};
+static int per_process_stats;
+static int per_process_stats_event = SORT_PROG_EVENT_N;
+static int per_device_and_cpu_stats = 1;
+static int track_ios;
+static int ppi_hash_by_pid = 1;
+static int verbose;
+static unsigned int act_mask = -1U;
+static int stats_printed;
+static int bin_output_msgs = 1;
+int data_is_native = -1;
 
-struct pid_map {
-	struct list_head hash_list;
-	u32 pid;
-	int index;
-	char name[0];
-};
+static FILE *dump_fp;
+static char *dump_binary;
 
-u64 get_record_time(struct trace *trace)
+static unsigned int t_alloc_cache;
+static unsigned int bit_alloc_cache;
+
+#define RB_BATCH_DEFAULT	(512)
+static unsigned int rb_batch = RB_BATCH_DEFAULT;
+
+static int pipeline;
+static char *pipename;
+
+static int text_output = 1;
+
+#define is_done()	(*(volatile int *)(&done))
+static volatile int done;
+
+struct timespec		abs_start_time;
+static unsigned long long start_timestamp;
+
+static int have_drv_data = 0;
+
+#define JHASH_RANDOM	(0x3af5f2ee)
+
+#define CPUS_PER_LONG	(8 * sizeof(unsigned long))
+#define CPU_IDX(cpu)	((cpu) / CPUS_PER_LONG)
+#define CPU_BIT(cpu)	((cpu) & (CPUS_PER_LONG - 1))
+
+static void io_warn_unless(struct blk_io_trace *t, int condition,
+			   const char *fmt, ...)
 {
-	return trace->io->time;
+	va_list ap;
+
+	if (condition)
+		return;
+	va_start(ap, fmt);
+	printf("(%d,%d) request %llu + %u: ",
+	       MAJOR(t->device), MINOR(t->device),
+	       t->sector, t->bytes);
+	vfprintf(stderr, fmt, ap);
+	va_end(ap);
 }
 
-void init_io_hash_table(void)
+static void output_binary(void *buf, int len)
 {
-	int i;
-	struct list_head *head;
-
-	for (i = 0; i < IO_HASH_TABLE_SIZE; i++) {
-		head = io_hash_table + i;
-		INIT_LIST_HEAD(head);
+	if (dump_binary) {
+		size_t n = fwrite(buf, len, 1, dump_fp);
+		if (n != 1) {
+			perror(dump_binary);
+			fclose(dump_fp);
+			dump_binary = NULL;
+		}
 	}
 }
 
-/* taken from the kernel hash.h */
-static inline u64 hash_sector(u64 val)
+static void resize_cpu_info(struct per_dev_info *pdi, int cpu)
 {
-	u64 hash = val;
+	struct per_cpu_info *cpus = pdi->cpus;
+	int ncpus = pdi->ncpus;
+	int new_count = cpu + 1;
+	int new_space, size;
+	char *new_start;
 
-	/*  Sigh, gcc can't optimise this alone like it does for 32 bits. */
-	u64 n = hash;
-	n <<= 18;
-	hash -= n;
-	n <<= 33;
-	hash -= n;
-	n <<= 3;
-	hash += n;
-	n <<= 3;
-	hash -= n;
-	n <<= 4;
-	hash += n;
-	n <<= 2;
-	hash += n;
+	size = new_count * sizeof(struct per_cpu_info);
+	cpus = realloc(cpus, size);
+	if (!cpus) {
+		char name[20];
+		fprintf(stderr, "Out of memory, CPU info for device %s (%d)\n",
+			get_dev_name(pdi, name, sizeof(name)), size);
+		exit(1);
+	}
 
-	/* High bits are more random, so use them. */
-	return hash >> (64 - IO_HASH_TABLE_BITS);
+	new_start = (char *)cpus + (ncpus * sizeof(struct per_cpu_info));
+	new_space = (new_count - ncpus) * sizeof(struct per_cpu_info);
+	memset(new_start, 0, new_space);
+
+	pdi->ncpus = new_count;
+	pdi->cpus = cpus;
+
+	for (new_count = 0; new_count < pdi->ncpus; new_count++) {
+		struct per_cpu_info *pci = &pdi->cpus[new_count];
+
+		if (!pci->fd) {
+			pci->fd = -1;
+			memset(&pci->rb_last, 0, sizeof(pci->rb_last));
+			pci->rb_last_entries = 0;
+			pci->last_sequence = -1;
+		}
+	}
 }
 
-static int io_hash_table_insert(struct pending_io *ins_pio)
+static struct per_cpu_info *get_cpu_info(struct per_dev_info *pdi, int cpu)
 {
-	u64 sector = ins_pio->sector;
-	u32 dev = ins_pio->device;
-	int slot = hash_sector(sector);
-	struct list_head *head;
-	struct pending_io *pio;
+	struct per_cpu_info *pci;
 
-	head = io_hash_table + slot;
-	list_for_each_entry(pio, head, hash_list) {
-		if (pio->sector == sector && pio->device == dev)
-			return -EEXIST;
+	if (cpu >= pdi->ncpus)
+		resize_cpu_info(pdi, cpu);
+
+	pci = &pdi->cpus[cpu];
+	pci->cpu = cpu;
+	return pci;
+}
+
+
+int resize_devices(char *name)
+{
+	int size = (ndevices + 1) * sizeof(struct per_dev_info);
+
+	devices = realloc(devices, size);
+	if (!devices) {
+		fprintf(stderr, "Out of memory, device %s (%d)\n", name, size);
+		return 1;
 	}
-	list_add_tail(&ins_pio->hash_list, head);
+	memset(&devices[ndevices], 0, sizeof(struct per_dev_info));
+	devices[ndevices].name = name;
+	ndevices++;
 	return 0;
 }
 
-static struct pending_io *io_hash_table_search(u64 sector, u32 dev)
+static struct per_dev_info *get_dev_info(dev_t dev)
 {
-	int slot = hash_sector(sector);
-	struct list_head *head;
-	struct pending_io *pio;
-
-	head = io_hash_table + slot;
-	list_for_each_entry(pio, head, hash_list) {
-		if (pio->sector == sector && pio->device == dev)
-			return pio;
-	}
-	return NULL;
-}
-
-static struct pending_io *hash_queued_io(struct blk_io_trace *io)
-{
-	struct pending_io *pio;
-	int ret;
-
-	pio = calloc(1, sizeof(*pio));
-	pio->sector = io->sector;
-	pio->device = io->device;
-	pio->pid = io->pid;
-
-	ret = io_hash_table_insert(pio);
-	if (ret < 0) {
-		/* crud, the IO is there already */
-		free(pio);
-		return NULL;
-	}
-	return pio;
-}
-
-static struct pending_io *hash_dispatched_io(struct blk_io_trace *io)
-{
-	struct pending_io *pio;
-
-	pio = io_hash_table_search(io->sector, io->device);
-	if (!pio) {
-		pio = hash_queued_io(io);
-		if (!pio)
-			return NULL;
-	}
-	pio->dispatch_time = io->time;
-	return pio;
-}
-
-static struct pending_io *hash_completed_io(struct blk_io_trace *io)
-{
-	struct pending_io *pio;
-
-	pio = io_hash_table_search(io->sector, io->device);
-
-	if (!pio)
-		return NULL;
-	return pio;
-}
-
-void init_process_hash_table(void)
-{
+	struct per_dev_info *pdi;
 	int i;
-	struct list_head *head;
 
-	for (i = 0; i < PROCESS_HASH_TABLE_SIZE; i++) {
-		head = process_hash_table + i;
-		INIT_LIST_HEAD(head);
+	for (i = 0; i < ndevices; i++) {
+		if (!devices[i].dev)
+			devices[i].dev = dev;
+		if (devices[i].dev == dev)
+			return &devices[i];
+	}
+
+	if (resize_devices(NULL))
+		return NULL;
+
+	pdi = &devices[ndevices - 1];
+	pdi->dev = dev;
+	pdi->first_reported_time = 0;
+	pdi->last_read_time = 0;
+
+	return pdi;
+}
+
+static void insert_skip(struct per_cpu_info *pci, unsigned long start,
+			unsigned long end)
+{
+	struct skip_info *sip;
+
+	for (sip = pci->skips_tail; sip != NULL; sip = sip->prev) {
+		if (end == (sip->start - 1)) {
+			sip->start = start;
+			return;
+		} else if (start == (sip->end + 1)) {
+			sip->end = end;
+			return;
+		}
+	}
+
+	sip = malloc(sizeof(struct skip_info));
+	sip->start = start;
+	sip->end = end;
+	sip->prev = sip->next = NULL;
+	if (pci->skips_tail == NULL)
+		pci->skips_head = pci->skips_tail = sip;
+	else {
+		sip->prev = pci->skips_tail;
+		pci->skips_tail->next = sip;
+		pci->skips_tail = sip;
 	}
 }
 
-static u32 hash_pid(u32 pid)
+static void remove_sip(struct per_cpu_info *pci, struct skip_info *sip)
 {
-	u32 hash = pid;
-
-	hash ^= pid >> 3;
-	hash ^= pid >> 3;
-	hash ^= pid >> 4;
-	hash ^= pid >> 6;
-	return (hash & (PROCESS_HASH_TABLE_SIZE - 1));
-}
-
-static struct pid_map *process_hash_search(u32 pid)
-{
-	int slot = hash_pid(pid);
-	struct list_head *head;
-	struct pid_map *pm;
-
-	head = process_hash_table + slot;
-	list_for_each_entry(pm, head, hash_list) {
-		if (pm->pid == pid)
-			return pm;
-	}
-	return NULL;
-}
-
-static struct pid_map *process_hash_insert(u32 pid, char *name)
-{
-	int slot = hash_pid(pid);
-	struct pid_map *pm;
-	int old_index = 0;
-	char buf[16];
-
-	pm = process_hash_search(pid);
-	if (pm) {
-		/* Entry exists and name shouldn't be changed? */
-		if (!name || !strcmp(name, pm->name))
-			return pm;
-		list_del(&pm->hash_list);
-		old_index = pm->index;
-		free(pm);
-	}
-	if (!name) {
-		sprintf(buf, "[%u]", pid);
-		name = buf;
-	}
-	pm = malloc(sizeof(struct pid_map) + strlen(name) + 1);
-	pm->pid = pid;
-	pm->index = old_index;
-	strcpy(pm->name, name);
-	list_add_tail(&pm->hash_list, process_hash_table + slot);
-
-	return pm;
-}
-
-static void handle_notify(struct trace *trace)
-{
-	struct blk_io_trace *io = trace->io;
-	void *payload = (char *)io + sizeof(*io);
-	u32 two32[2];
-
-	if (io->action == BLK_TN_PROCESS) {
-		if (io_per_process)
-			process_hash_insert(io->pid, payload);
-		return;
+	if (sip->prev == NULL) {
+		if (sip->next == NULL)
+			pci->skips_head = pci->skips_tail = NULL;
+		else {
+			pci->skips_head = sip->next;
+			sip->next->prev = NULL;
+		}
+	} else if (sip->next == NULL) {
+		pci->skips_tail = sip->prev;
+		sip->prev->next = NULL;
+	} else {
+		sip->prev->next = sip->next;
+		sip->next->prev = sip->prev;
 	}
 
-	if (io->action != BLK_TN_TIMESTAMP)
-		return;
-
-	if (io->pdu_len != sizeof(two32))
-		return;
-
-	memcpy(two32, payload, sizeof(two32));
-	trace->start_timestamp = io->time;
-	trace->abs_start_time.tv_sec = two32[0];
-	trace->abs_start_time.tv_nsec = two32[1];
-	if (trace->abs_start_time.tv_nsec < 0) {
-		trace->abs_start_time.tv_sec--;
-		trace->abs_start_time.tv_nsec += 1000000000;
-	}
+	sip->prev = sip->next = NULL;
+	free(sip);
 }
 
-int next_record(struct trace *trace)
+#define IN_SKIP(sip,seq) (((sip)->start <= (seq)) && ((seq) <= sip->end))
+static int check_current_skips(struct per_cpu_info *pci, unsigned long seq)
 {
-	int skip = trace->io->pdu_len;
-	u64 offset;
+	struct skip_info *sip;
 
-	trace->cur += sizeof(*trace->io) + skip;
-	offset = trace->cur - trace->start;
-	if (offset >= trace->len)
-		return 1;
-
-	trace->io = (struct blk_io_trace *)trace->cur;
-	return 0;
-}
-
-void first_record(struct trace *trace)
-{
-	trace->cur = trace->start;
-	trace->io = (struct blk_io_trace *)trace->cur;
-}
-
-static int is_io_event(struct blk_io_trace *test)
-{
-	char *message;
-	if (!(test->action & BLK_TC_ACT(BLK_TC_NOTIFY)))
-		return 1;
-	if (test->action == BLK_TN_MESSAGE) {
-		int len = test->pdu_len;
-		if (len < 3)
-			return 0;
-		message = (char *)(test + 1);
-		if (strncmp(message, "fio ", 4) == 0) {
+	for (sip = pci->skips_tail; sip != NULL; sip = sip->prev) {
+		if (IN_SKIP(sip, seq)) {
+			if (sip->start == seq) {
+				if (sip->end == seq)
+					remove_sip(pci, sip);
+				else
+					sip->start += 1;
+			} else if (sip->end == seq)
+				sip->end -= 1;
+			else {
+				sip->end = seq - 1;
+				insert_skip(pci, seq + 1, sip->end);
+			}
 			return 1;
 		}
 	}
+
 	return 0;
 }
 
-u64 find_last_time(struct trace *trace)
+static void collect_pdi_skips(struct per_dev_info *pdi)
 {
-	char *p = trace->start + trace->len;
-	struct blk_io_trace *test;
-	int search_len = 0;
-	u64 found = 0;
+	struct skip_info *sip;
+	int cpu;
 
-	if (trace->len < sizeof(*trace->io))
-		return 0;
-	p -= sizeof(*trace->io);
-	while (p >= trace->start) {
-		test = (struct blk_io_trace *)p;
-		if (CHECK_MAGIC(test) && is_io_event(test)) {
-			u64 offset = p - trace->start;
-			if (offset + sizeof(*test) + test->pdu_len == trace->len) {
-				return test->time;
+	pdi->skips = 0;
+	pdi->seq_skips = 0;
+
+	for (cpu = 0; cpu < pdi->ncpus; cpu++) {
+		struct per_cpu_info *pci = &pdi->cpus[cpu];
+
+		for (sip = pci->skips_head; sip != NULL; sip = sip->next) {
+			pdi->skips++;
+			pdi->seq_skips += (sip->end - sip->start + 1);
+			if (verbose)
+				fprintf(stderr,"(%d,%d): skipping %lu -> %lu\n",
+					MAJOR(pdi->dev), MINOR(pdi->dev),
+					sip->start, sip->end);
+		}
+	}
+}
+
+static void cpu_mark_online(struct per_dev_info *pdi, unsigned int cpu)
+{
+	if (cpu >= pdi->cpu_map_max || !pdi->cpu_map) {
+		int new_max = (cpu + CPUS_PER_LONG) & ~(CPUS_PER_LONG - 1);
+		unsigned long *map = malloc(new_max / sizeof(long));
+
+		memset(map, 0, new_max / sizeof(long));
+
+		if (pdi->cpu_map) {
+			memcpy(map, pdi->cpu_map, pdi->cpu_map_max / sizeof(long));
+			free(pdi->cpu_map);
+		}
+
+		pdi->cpu_map = map;
+		pdi->cpu_map_max = new_max;
+	}
+
+	pdi->cpu_map[CPU_IDX(cpu)] |= (1UL << CPU_BIT(cpu));
+}
+
+static inline void cpu_mark_offline(struct per_dev_info *pdi, int cpu)
+{
+	pdi->cpu_map[CPU_IDX(cpu)] &= ~(1UL << CPU_BIT(cpu));
+}
+
+static inline int cpu_is_online(struct per_dev_info *pdi, int cpu)
+{
+	return (pdi->cpu_map[CPU_IDX(cpu)] & (1UL << CPU_BIT(cpu))) != 0;
+}
+
+static inline int ppm_hash_pid(pid_t pid)
+{
+	return jhash_1word(pid, JHASH_RANDOM) & PPM_HASH_MASK;
+}
+
+static struct process_pid_map *find_ppm(pid_t pid)
+{
+	const int hash_idx = ppm_hash_pid(pid);
+	struct process_pid_map *ppm;
+
+	ppm = ppm_hash_table[hash_idx];
+	while (ppm) {
+		if (ppm->pid == pid)
+			return ppm;
+
+		ppm = ppm->hash_next;
+	}
+
+	return NULL;
+}
+
+static struct process_pid_map *add_ppm_hash(pid_t pid, const char *name)
+{
+	const int hash_idx = ppm_hash_pid(pid);
+	struct process_pid_map *ppm;
+
+	ppm = find_ppm(pid);
+	if (!ppm) {
+		ppm = malloc(sizeof(*ppm));
+		memset(ppm, 0, sizeof(*ppm));
+		ppm->pid = pid;
+		memset(ppm->comm, 0, sizeof(ppm->comm));
+		strncpy(ppm->comm, name, sizeof(ppm->comm));
+		ppm->comm[sizeof(ppm->comm) - 1] = '\0';
+		ppm->hash_next = ppm_hash_table[hash_idx];
+		ppm_hash_table[hash_idx] = ppm;
+	}
+
+	return ppm;
+}
+
+static void handle_notify(struct blk_io_trace *bit)
+{
+	void	*payload = (caddr_t) bit + sizeof(*bit);
+	__u32	two32[2];
+
+	switch (bit->action & ~__BLK_TN_CGROUP) {
+	case BLK_TN_PROCESS:
+		add_ppm_hash(bit->pid, payload);
+		break;
+
+	case BLK_TN_TIMESTAMP:
+		if (bit->pdu_len != sizeof(two32))
+			return;
+		memcpy(two32, payload, sizeof(two32));
+		if (!data_is_native) {
+			two32[0] = be32_to_cpu(two32[0]);
+			two32[1] = be32_to_cpu(two32[1]);
+		}
+		start_timestamp = bit->time;
+		abs_start_time.tv_sec  = two32[0];
+		abs_start_time.tv_nsec = two32[1];
+		if (abs_start_time.tv_nsec < 0) {
+			abs_start_time.tv_sec--;
+			abs_start_time.tv_nsec += 1000000000;
+		}
+
+		break;
+
+	case BLK_TN_MESSAGE:
+		if (bit->pdu_len > 0) {
+			char msg[bit->pdu_len+1];
+			int len = bit->pdu_len;
+			char cgidstr[24];
+
+			cgidstr[0] = 0;
+			if (bit->action & __BLK_TN_CGROUP) {
+				struct blk_io_cgroup_payload *cgid = payload;
+
+				sprintf(cgidstr, "%x,%x ", cgid->ino,
+					cgid->gen);
+				payload += sizeof(struct blk_io_cgroup_payload);
+				len -= sizeof(struct blk_io_cgroup_payload);
 			}
+			memcpy(msg, (char *)payload, len);
+			msg[len] = '\0';
+
+			fprintf(ofp,
+				"%3d,%-3d %2d %8s %5d.%09lu %5u %s%2s %3s %s\n",
+				MAJOR(bit->device), MINOR(bit->device),
+				bit->cpu, "0", (int)SECONDS(bit->time),
+				(unsigned long)NANO_SECONDS(bit->time),
+				bit->pid, cgidstr, "m", "N", msg);
 		}
-		p--;
-		search_len++;
-		if (search_len > 8192) {
-			break;
-		}
-	}
+		break;
 
-	/* searching backwards didn't work out, we'll have to scan the file */
-	first_record(trace);
-	while (1) {
-		if (is_io_event(trace->io))
-			found = trace->io->time;
-		if (next_record(trace))
-			break;
-	}
-	first_record(trace);
-	return found;
-}
-
-static int parse_fio_bank_message(struct trace *trace, u64 *bank_ret, u64 *offset_ret,
-			   u64 *num_banks_ret)
-{
-	char *s;
-	char *next;
-	char *message;
-	struct blk_io_trace *test = trace->io;
-	int len = test->pdu_len;
-	u64 bank;
-	u64 offset;
-	u64 num_banks;
-
-	if (!(test->action & BLK_TC_ACT(BLK_TC_NOTIFY)))
-		return -1;
-	if (test->action != BLK_TN_MESSAGE)
-		return -1;
-
-	/* the message is fio rw bank offset num_banks */
-	if (len < 3)
-		return -1;
-	message = (char *)(test + 1);
-	if (strncmp(message, "fio r ", 6) != 0)
-		return -1;
-
-	message = strndup(message, len);
-	s = strchr(message, ' ');
-	if (!s)
-		goto out;
-	s++;
-	s = strchr(s, ' ');
-	if (!s)
-		goto out;
-
-	bank = strtoll(s, &next, 10);
-	if (s == next)
-		goto out;
-	s = next;
-
-	offset = strtoll(s, &next, 10);
-	if (s == next)
-		goto out;
-	s = next;
-
-	num_banks = strtoll(s, &next, 10);
-	if (s == next)
-		goto out;
-
-	*bank_ret = bank;
-	*offset_ret = offset;
-	*num_banks_ret = num_banks;
-
-	return 0;
-out:
-	free(message);
-	return -1;
-}
-
-static struct dev_info *lookup_dev(struct trace *trace, struct blk_io_trace *io)
-{
-	u32 dev = io->device;
-	int i;
-	struct dev_info *di = NULL;
-
-	for (i = 0; i < trace->num_devices; i++) {
-		if (trace->devices[i].device == dev) {
-			di = trace->devices + i;
-			goto found;
-		}
-	}
-	i = trace->num_devices++;
-	if (i >= MAX_DEVICES_PER_TRACE) {
-		fprintf(stderr, "Trace contains too many devices (%d)\n", i);
-		exit(1);
-	}
-	di = trace->devices + i;
-	di->device = dev;
-found:
-	return di;
-}
-
-static void map_devices(struct trace *trace)
-{
-	struct dev_info *di;
-	u64 found;
-	u64 map_start = 0;
-	int i;
-
-	first_record(trace);
-	while (1) {
-		if (!(trace->io->action & BLK_TC_ACT(BLK_TC_NOTIFY))) {
-			di = lookup_dev(trace, trace->io);
-			found = trace->io->sector << 9;
-			if (found < di->min)
-				di->min = found;
-
-			found += trace->io->bytes;
-			if (di->max < found)
-				di->max = found;
-		}
-		if (next_record(trace))
-			break;
-	}
-	first_record(trace);
-	for (i = 0; i < trace->num_devices; i++) {
-		di = trace->devices + i;
-		di->map = map_start;
-		map_start += di->max - di->min;
+	default:
+		/* Ignore unknown notify events */
+		;
 	}
 }
 
-static u64 map_io(struct trace *trace, struct blk_io_trace *io)
+char *find_process_name(pid_t pid)
 {
-	struct dev_info *di = lookup_dev(trace, io);
-	u64 val = trace->io->sector << 9;
-	return di->map + val - di->min;
+	struct process_pid_map *ppm = find_ppm(pid);
+
+	if (ppm)
+		return ppm->comm;
+
+	return NULL;
 }
 
-void find_extreme_offsets(struct trace *trace, u64 *min_ret, u64 *max_ret, u64 *max_bank_ret,
-			  u64 *max_offset_ret)
+static inline int ppi_hash_pid(pid_t pid)
 {
-	u64 found = 0;
-	u64 max = 0, min = ~(u64)0;
-	u64 max_bank = 0;
-	u64 max_bank_offset = 0;
-	u64 num_banks = 0;
-
-	map_devices(trace);
-
-	first_record(trace);
-	while (1) {
-		if (!(trace->io->action & BLK_TC_ACT(BLK_TC_NOTIFY))) {
-			found = map_io(trace, trace->io);
-			if (found < min)
-				min = found;
-
-			found += trace->io->bytes;
-			if (max < found)
-				max = found;
-		} else {
-			u64 bank;
-			u64 offset;
-			if (!parse_fio_bank_message(trace, &bank,
-						    &offset, &num_banks)) {
-				if (bank > max_bank)
-					max_bank = bank;
-				if (offset > max_bank_offset)
-					max_bank_offset = offset;
-			}
-		}
-		if (next_record(trace))
-			break;
-	}
-	first_record(trace);
-	*min_ret = min;
-	*max_ret = max;
-	*max_bank_ret = max_bank;
-	*max_offset_ret = max_bank_offset;
+	return jhash_1word(pid, JHASH_RANDOM) & PPI_HASH_MASK;
 }
 
-static void check_io_types(struct trace *trace)
+static inline int ppi_hash_name(const char *name)
 {
-	struct blk_io_trace *io = trace->io;
-	int action = io->action & BLK_TA_MASK;
-
-	if (!(io->action & BLK_TC_ACT(BLK_TC_NOTIFY))) {
-		switch (action) {
-		case __BLK_TA_COMPLETE:
-			trace->found_completion = 1;
-			break;
-		case __BLK_TA_ISSUE:
-			trace->found_issue = 1;
-			break;
-		case __BLK_TA_QUEUE:
-			trace->found_queue = 1;
-			break;
-		};
-	}
+	return jhash(name, 16, JHASH_RANDOM) & PPI_HASH_MASK;
 }
 
-
-int filter_outliers(struct trace *trace, u64 min_offset, u64 max_offset,
-		    u64 *yzoom_min, u64 *yzoom_max)
+static inline int ppi_hash(struct per_process_info *ppi)
 {
-	int hits[11];
-	u64 max_per_bucket[11];
-	u64 min_per_bucket[11];
-	u64 bytes_per_bucket = (max_offset - min_offset + 1) / 10;
-	int slot;
-	int fat_count = 0;
+	struct process_pid_map *ppm = ppi->ppm;
 
-	memset(hits, 0, sizeof(int) * 11);
-	memset(max_per_bucket, 0, sizeof(u64) * 11);
-	memset(min_per_bucket, 0xff, sizeof(u64) * 11);
-	first_record(trace);
-	while (1) {
-		check_io_types(trace);
-		if (!(trace->io->action & BLK_TC_ACT(BLK_TC_NOTIFY)) &&
-		    (trace->io->action & BLK_TA_MASK) == __BLK_TA_QUEUE) {
-			u64 off = map_io(trace, trace->io) - min_offset;
+	if (ppi_hash_by_pid)
+		return ppi_hash_pid(ppm->pid);
 
-			slot = (int)(off / bytes_per_bucket);
-			hits[slot]++;
-			if (off < min_per_bucket[slot])
-				min_per_bucket[slot] = off;
+	return ppi_hash_name(ppm->comm);
+}
 
-			off += trace->io->bytes;
-			slot = (int)(off / bytes_per_bucket);
-			hits[slot]++;
-			if (off > max_per_bucket[slot])
-				max_per_bucket[slot] = off;
-		}
-		if (next_record(trace))
-			break;
-	}
-	first_record(trace);
-	for (slot = 0; slot < 11; slot++) {
-		if (hits[slot] > fat_count) {
-			fat_count = hits[slot];
-		}
-	}
+static inline void add_ppi_to_hash(struct per_process_info *ppi)
+{
+	const int hash_idx = ppi_hash(ppi);
 
-	*yzoom_max = max_offset;
-	for (slot = 10; slot >= 0; slot--) {
-		double d = hits[slot];
+	ppi->hash_next = ppi_hash_table[hash_idx];
+	ppi_hash_table[hash_idx] = ppi;
+}
 
-		if (d >= (double)fat_count * .05) {
-			*yzoom_max = max_per_bucket[slot] + min_offset;
-			break;
-		}
+static inline void add_ppi_to_list(struct per_process_info *ppi)
+{
+	ppi->list_next = ppi_list;
+	ppi_list = ppi;
+	ppi_list_entries++;
+}
+
+static struct per_process_info *find_ppi_by_name(char *name)
+{
+	const int hash_idx = ppi_hash_name(name);
+	struct per_process_info *ppi;
+
+	ppi = ppi_hash_table[hash_idx];
+	while (ppi) {
+		struct process_pid_map *ppm = ppi->ppm;
+
+		if (!strcmp(ppm->comm, name))
+			return ppi;
+
+		ppi = ppi->hash_next;
 	}
 
-	*yzoom_min = min_offset;
-	for (slot = 0; slot < 10; slot++) {
-		double d = hits[slot];
+	return NULL;
+}
 
-		if (d >= (double)fat_count * .05) {
-			*yzoom_min = min_per_bucket[slot] + min_offset;
-			break;
-		}
+static struct per_process_info *find_ppi_by_pid(pid_t pid)
+{
+	const int hash_idx = ppi_hash_pid(pid);
+	struct per_process_info *ppi;
+
+	ppi = ppi_hash_table[hash_idx];
+	while (ppi) {
+		struct process_pid_map *ppm = ppi->ppm;
+
+		if (ppm->pid == pid)
+			return ppi;
+
+		ppi = ppi->hash_next;
 	}
+
+	return NULL;
+}
+
+static struct per_process_info *find_ppi(pid_t pid)
+{
+	struct per_process_info *ppi;
+	char *name;
+
+	if (ppi_hash_by_pid)
+		return find_ppi_by_pid(pid);
+
+	name = find_process_name(pid);
+	if (!name)
+		return NULL;
+
+	ppi = find_ppi_by_name(name);
+	if (ppi && ppi->ppm->pid != pid)
+		ppi->more_than_one = 1;
+
+	return ppi;
+}
+
+/*
+ * struct trace and blktrace allocation cache, we do potentially
+ * millions of mallocs for these structures while only using at most
+ * a few thousand at the time
+ */
+static inline void t_free(struct trace *t)
+{
+	if (t_alloc_cache < 1024) {
+		t->next = t_alloc_list;
+		t_alloc_list = t;
+		t_alloc_cache++;
+	} else
+		free(t);
+}
+
+static inline struct trace *t_alloc(void)
+{
+	struct trace *t = t_alloc_list;
+
+	if (t) {
+		t_alloc_list = t->next;
+		t_alloc_cache--;
+		return t;
+	}
+
+	return malloc(sizeof(*t));
+}
+
+static inline void bit_free(struct blk_io_trace *bit)
+{
+	if (bit_alloc_cache < 1024 && !bit->pdu_len) {
+		/*
+		 * abuse a 64-bit field for a next pointer for the free item
+		 */
+		bit->time = (__u64) (unsigned long) bit_alloc_list;
+		bit_alloc_list = (struct blk_io_trace *) bit;
+		bit_alloc_cache++;
+	} else
+		free(bit);
+}
+
+static inline struct blk_io_trace *bit_alloc(void)
+{
+	struct blk_io_trace *bit = bit_alloc_list;
+
+	if (bit) {
+		bit_alloc_list = (struct blk_io_trace *) (unsigned long) \
+				 bit->time;
+		bit_alloc_cache--;
+		return bit;
+	}
+
+	return malloc(sizeof(*bit));
+}
+
+static inline void __put_trace_last(struct per_dev_info *pdi, struct trace *t)
+{
+	struct per_cpu_info *pci = get_cpu_info(pdi, t->bit->cpu);
+
+	rb_erase(&t->rb_node, &pci->rb_last);
+	pci->rb_last_entries--;
+
+	bit_free(t->bit);
+	t_free(t);
+}
+
+static void put_trace(struct per_dev_info *pdi, struct trace *t)
+{
+	rb_erase(&t->rb_node, &rb_sort_root);
+	rb_sort_entries--;
+
+	trace_rb_insert_last(pdi, t);
+}
+
+static inline int trace_rb_insert(struct trace *t, struct rb_root *root)
+{
+	struct rb_node **p = &root->rb_node;
+	struct rb_node *parent = NULL;
+	struct trace *__t;
+
+	while (*p) {
+		parent = *p;
+
+		__t = rb_entry(parent, struct trace, rb_node);
+
+		if (t->bit->time < __t->bit->time)
+			p = &(*p)->rb_left;
+		else if (t->bit->time > __t->bit->time)
+			p = &(*p)->rb_right;
+		else if (t->bit->device < __t->bit->device)
+			p = &(*p)->rb_left;
+		else if (t->bit->device > __t->bit->device)
+			p = &(*p)->rb_right;
+		else if (t->bit->sequence < __t->bit->sequence)
+			p = &(*p)->rb_left;
+		else	/* >= sequence */
+			p = &(*p)->rb_right;
+	}
+
+	rb_link_node(&t->rb_node, parent, p);
+	rb_insert_color(&t->rb_node, root);
 	return 0;
 }
 
-static char footer[] = ".blktrace.0";
-static int footer_len = sizeof(footer) - 1;
-
-static int match_trace(char *name, int *len)
+static inline int trace_rb_insert_sort(struct trace *t)
 {
-	int match_len;
-	int footer_start;
-
-	match_len = strlen(name);
-	if (match_len <= footer_len)
+	if (!trace_rb_insert(t, &rb_sort_root)) {
+		rb_sort_entries++;
 		return 0;
+	}
 
-	footer_start = match_len - footer_len;
-	if (strcmp(name + footer_start, footer) != 0)
-		return 0;
-
-	if (len)
-		*len = match_len;
 	return 1;
 }
 
-struct tracelist {
-	struct tracelist *next;
-	char *name;
-};
-
-static struct tracelist *traces_list(char *dir_name, int *len)
+static int trace_rb_insert_last(struct per_dev_info *pdi, struct trace *t)
 {
-	int count = 0;
-	struct tracelist *traces = NULL;
-	int dlen = strlen(dir_name);
-	DIR *dir = opendir(dir_name);
-	if (!dir)
-		return NULL;
+	struct per_cpu_info *pci = get_cpu_info(pdi, t->bit->cpu);
 
-	while (1) {
-		int n = 0;
-		struct tracelist *tl;
-		struct dirent *d = readdir(dir);
-		if (!d)
+	if (trace_rb_insert(t, &pci->rb_last))
+		return 1;
+
+	pci->rb_last_entries++;
+
+	if (pci->rb_last_entries > rb_batch * pdi->nfiles) {
+		struct rb_node *n = rb_first(&pci->rb_last);
+
+		t = rb_entry(n, struct trace, rb_node);
+		__put_trace_last(pdi, t);
+	}
+
+	return 0;
+}
+
+static struct trace *trace_rb_find(dev_t device, unsigned long sequence,
+				   struct rb_root *root, int order)
+{
+	struct rb_node *n = root->rb_node;
+	struct rb_node *prev = NULL;
+	struct trace *__t;
+
+	while (n) {
+		__t = rb_entry(n, struct trace, rb_node);
+		prev = n;
+
+		if (device < __t->bit->device)
+			n = n->rb_left;
+		else if (device > __t->bit->device)
+			n = n->rb_right;
+		else if (sequence < __t->bit->sequence)
+			n = n->rb_left;
+		else if (sequence > __t->bit->sequence)
+			n = n->rb_right;
+		else
+			return __t;
+	}
+
+	/*
+	 * hack - the list may not be sequence ordered because some
+	 * events don't have sequence and time matched. so we end up
+	 * being a little off in the rb lookup here, because we don't
+	 * know the time we are looking for. compensate by browsing
+	 * a little ahead from the last entry to find the match
+	 */
+	if (order && prev) {
+		int max = 5;
+
+		while (((n = rb_next(prev)) != NULL) && max--) {
+			__t = rb_entry(n, struct trace, rb_node);
+
+			if (__t->bit->device == device &&
+			    __t->bit->sequence == sequence)
+				return __t;
+
+			prev = n;
+		}
+	}
+
+	return NULL;
+}
+
+static inline struct trace *trace_rb_find_last(struct per_dev_info *pdi,
+					       struct per_cpu_info *pci,
+					       unsigned long seq)
+{
+	return trace_rb_find(pdi->dev, seq, &pci->rb_last, 0);
+}
+
+static inline int track_rb_insert(struct per_dev_info *pdi,struct io_track *iot)
+{
+	struct rb_node **p = &pdi->rb_track.rb_node;
+	struct rb_node *parent = NULL;
+	struct io_track *__iot;
+
+	while (*p) {
+		parent = *p;
+		__iot = rb_entry(parent, struct io_track, rb_node);
+
+		if (iot->sector < __iot->sector)
+			p = &(*p)->rb_left;
+		else if (iot->sector > __iot->sector)
+			p = &(*p)->rb_right;
+		else {
+			fprintf(stderr,
+				"sector alias (%Lu) on device %d,%d!\n",
+				(unsigned long long) iot->sector,
+				MAJOR(pdi->dev), MINOR(pdi->dev));
+			return 1;
+		}
+	}
+
+	rb_link_node(&iot->rb_node, parent, p);
+	rb_insert_color(&iot->rb_node, &pdi->rb_track);
+	return 0;
+}
+
+static struct io_track *__find_track(struct per_dev_info *pdi, __u64 sector)
+{
+	struct rb_node *n = pdi->rb_track.rb_node;
+	struct io_track *__iot;
+
+	while (n) {
+		__iot = rb_entry(n, struct io_track, rb_node);
+
+		if (sector < __iot->sector)
+			n = n->rb_left;
+		else if (sector > __iot->sector)
+			n = n->rb_right;
+		else
+			return __iot;
+	}
+
+	return NULL;
+}
+
+static inline struct io_track *first_iot(struct io_track_req *req)
+{
+	return (struct io_track *)(req + 1);
+}
+
+static struct io_track *find_track(struct per_dev_info *pdi, pid_t pid,
+				   __u64 sector)
+{
+	struct io_track *iot;
+
+	iot = __find_track(pdi, sector);
+	if (!iot) {
+		struct io_track_req *req;
+
+		req = malloc(sizeof(*req) + sizeof(*iot));
+		req->ppm = find_ppm(pid);
+		if (!req->ppm)
+			req->ppm = add_ppm_hash(pid, "unknown");
+		req->allocation_time = -1ULL;
+		req->queue_time = -1ULL;
+		req->dispatch_time = -1ULL;
+		req->completion_time = -1ULL;
+		iot = first_iot(req);
+		iot->req = req;
+		iot->next = NULL;
+		iot->sector = sector;
+		track_rb_insert(pdi, iot);
+	}
+
+	return iot;
+}
+
+static void log_track_frontmerge(struct per_dev_info *pdi,
+				 struct blk_io_trace *t)
+{
+	struct io_track *iot;
+
+	if (!track_ios)
+		return;
+
+	iot = __find_track(pdi, t->sector + t_sec(t));
+	if (!iot) {
+		if (verbose)
+			fprintf(stderr, "merge not found for (%d,%d): %llu\n",
+				MAJOR(t->device), MINOR(t->device),
+				(unsigned long long) t->sector + t_sec(t));
+		return;
+	}
+
+	rb_erase(&iot->rb_node, &pdi->rb_track);
+	iot->sector -= t_sec(t);
+	track_rb_insert(pdi, iot);
+}
+
+static void log_track_getrq(struct per_dev_info *pdi, struct blk_io_trace *t)
+{
+	struct io_track *iot;
+	struct io_track_req *req;
+
+	if (!track_ios)
+		return;
+
+	iot = find_track(pdi, t->pid, t->sector);
+	req = iot->req;
+	io_warn_unless(t, req->allocation_time == -1ULL,
+		       "confused about %s time", "allocation");
+	req->allocation_time = t->time;
+}
+
+/*
+ * for md/dm setups, the interesting cycle is Q -> C. So track queueing
+ * time here, as dispatch time
+ */
+static void log_track_queue(struct per_dev_info *pdi, struct blk_io_trace *t)
+{
+	struct io_track *iot;
+	struct io_track_req *req;
+
+	if (!track_ios)
+		return;
+
+	iot = find_track(pdi, t->pid, t->sector);
+	req = iot->req;
+	io_warn_unless(t, req->dispatch_time == -1ULL,
+		       "confused about %s time", "dispatch");
+	req->dispatch_time = t->time;
+}
+
+static void log_track_split(struct per_dev_info *pdi, struct blk_io_trace *t)
+{
+	struct io_track *iot, *split;
+
+	/*
+	 * With a split request, the completion event will refer to the last
+	 * part of the original request, but other events might refer to other
+	 * parts.
+	 */
+	iot = find_track(pdi, t->pid, t->sector);
+	split = malloc(sizeof(*iot));
+	split->req = iot->req;
+	split->next = iot->next;
+	iot->next = split;
+	split->sector = iot->sector + t_sec(t);
+	track_rb_insert(pdi, split);
+}
+
+/*
+ * return time between rq allocation and insertion
+ */
+static unsigned long long log_track_insert(struct per_dev_info *pdi,
+					   struct blk_io_trace *t)
+{
+	unsigned long long elapsed;
+	struct io_track *iot;
+	struct io_track_req *req;
+
+	if (!track_ios)
+		return -1;
+
+	iot = find_track(pdi, t->pid, t->sector);
+	req = iot->req;
+	io_warn_unless(t, req->queue_time == -1ULL,
+		       "confused about %s time", "queue");
+	req->queue_time = t->time;
+
+	if (req->allocation_time == -1ULL)
+		return -1;
+
+	elapsed = req->queue_time - req->allocation_time;
+
+	if (per_process_stats) {
+		struct per_process_info *ppi = find_ppi(req->ppm->pid);
+		int w = (t->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+
+		if (ppi && elapsed > ppi->longest_allocation_wait[w])
+			ppi->longest_allocation_wait[w] = elapsed;
+	}
+
+	return elapsed;
+}
+
+/*
+ * return time between queue and issue
+ */
+static unsigned long long log_track_issue(struct per_dev_info *pdi,
+					  struct blk_io_trace *t)
+{
+	unsigned long long elapsed = -1ULL;
+	struct io_track *iot;
+	struct io_track_req *req;
+
+	if (!track_ios)
+		return -1;
+	if ((t->action & BLK_TC_ACT(BLK_TC_FS)) == 0)
+		return -1;
+
+	iot = __find_track(pdi, t->sector);
+	if (!iot) {
+		if (verbose)
+			fprintf(stderr, "issue not found for (%d,%d): %llu\n",
+				MAJOR(t->device), MINOR(t->device),
+				(unsigned long long) t->sector);
+		return -1;
+	}
+
+	req = iot->req;
+	io_warn_unless(t, req->dispatch_time == -1ULL,
+		       "confused about %s time", "dispatch");
+	req->dispatch_time = t->time;
+	if (req->queue_time != -1ULL)
+		elapsed = req->dispatch_time - req->queue_time;
+
+	if (elapsed != -1ULL && per_process_stats) {
+		struct per_process_info *ppi = find_ppi(req->ppm->pid);
+		int w = (t->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+
+		if (ppi && elapsed > ppi->longest_dispatch_wait[w])
+			ppi->longest_dispatch_wait[w] = elapsed;
+	}
+
+	return elapsed;
+}
+
+static void fixup_complete(struct per_dev_info *pdi, struct blk_io_trace *t)
+{
+	struct io_track *iot;
+	__u64 start_sector;
+
+	iot = __find_track(pdi, t->sector);
+	if (!iot)
+		return;
+
+	/*
+	 * When a split io completes, the sector and length of the completion
+	 * refer to the last part of the original request.  Fix the sector and
+	 * length of the complete event to match the original request.
+	 */
+	start_sector = first_iot(iot->req)->sector;
+	t->bytes += (t->sector - start_sector) << 9;
+	t->sector = start_sector;
+}
+
+/*
+ * return time between dispatch and complete
+ */
+static unsigned long long log_track_complete(struct per_dev_info *pdi,
+					     struct blk_io_trace *t)
+{
+	unsigned long long elapsed = -1ULL;
+	struct io_track *iot, *next;
+	struct io_track_req *req;
+
+	if (!track_ios)
+		return -1;
+
+	iot = __find_track(pdi, t->sector);
+	if (!iot) {
+		if (verbose)
+			fprintf(stderr,"complete not found for (%d,%d): %llu\n",
+				MAJOR(t->device), MINOR(t->device),
+				(unsigned long long) t->sector);
+		return -1;
+	}
+
+	req = iot->req;
+	io_warn_unless(t, req->completion_time == -1ULL,
+		       "confused about %s time", "completion");
+	req->completion_time = t->time;
+	if (req->dispatch_time != -1ULL)
+		elapsed = req->completion_time - req->dispatch_time;
+
+	if (elapsed != -1ULL && per_process_stats) {
+		struct per_process_info *ppi = find_ppi(req->ppm->pid);
+		int w = (t->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+
+		if (ppi && elapsed > ppi->longest_completion_wait[w])
+			ppi->longest_completion_wait[w] = elapsed;
+	}
+
+	/*
+	 * kill the trace, we don't need it after completion
+	 */
+	for (iot = first_iot(req); iot; iot = next) {
+		next = iot->next;
+		rb_erase(&iot->rb_node, &pdi->rb_track);
+		if (iot != first_iot(req))
+			free(iot);
+	}
+	free(req);
+
+	return elapsed;
+}
+
+
+static struct io_stats *find_process_io_stats(pid_t pid)
+{
+	struct per_process_info *ppi = find_ppi(pid);
+
+	if (!ppi) {
+		ppi = malloc(sizeof(*ppi));
+		memset(ppi, 0, sizeof(*ppi));
+		ppi->ppm = find_ppm(pid);
+		if (!ppi->ppm)
+			ppi->ppm = add_ppm_hash(pid, "unknown");
+		add_ppi_to_hash(ppi);
+		add_ppi_to_list(ppi);
+	}
+
+	return &ppi->io_stats;
+}
+
+static char *get_dev_name(struct per_dev_info *pdi, char *buffer, int size)
+{
+	if (pdi->name)
+		snprintf(buffer, size, "%s", pdi->name);
+	else
+		snprintf(buffer, size, "%d,%d",MAJOR(pdi->dev),MINOR(pdi->dev));
+	return buffer;
+}
+
+static void check_time(struct per_dev_info *pdi, struct blk_io_trace *bit)
+{
+	unsigned long long this = bit->time;
+	unsigned long long last = pdi->last_reported_time;
+
+	pdi->backwards = (this < last) ? 'B' : ' ';
+	pdi->last_reported_time = this;
+}
+
+static inline void __account_m(struct io_stats *ios, struct blk_io_trace *t,
+			       int rw)
+{
+	if (rw) {
+		ios->mwrites++;
+		ios->mwrite_kb += t_kb(t);
+		ios->mwrite_b += t_b(t);
+	} else {
+		ios->mreads++;
+		ios->mread_kb += t_kb(t);
+		ios->mread_b += t_b(t);
+	}
+}
+
+static inline void account_m(struct blk_io_trace *t, struct per_cpu_info *pci,
+			     int rw)
+{
+	__account_m(&pci->io_stats, t, rw);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_m(ios, t, rw);
+	}
+}
+
+static inline void __account_pc_queue(struct io_stats *ios,
+				      struct blk_io_trace *t, int rw)
+{
+	if (rw) {
+		ios->qwrites_pc++;
+		ios->qwrite_kb_pc += t_kb(t);
+		ios->qwrite_b_pc += t_b(t);
+	} else {
+		ios->qreads_pc++;
+		ios->qread_kb += t_kb(t);
+		ios->qread_b_pc += t_b(t);
+	}
+}
+
+static inline void account_pc_queue(struct blk_io_trace *t,
+				    struct per_cpu_info *pci, int rw)
+{
+	__account_pc_queue(&pci->io_stats, t, rw);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_pc_queue(ios, t, rw);
+	}
+}
+
+static inline void __account_pc_issue(struct io_stats *ios, int rw,
+				      unsigned int bytes)
+{
+	if (rw) {
+		ios->iwrites_pc++;
+		ios->iwrite_kb_pc += bytes >> 10;
+		ios->iwrite_b_pc += bytes & 1023;
+	} else {
+		ios->ireads_pc++;
+		ios->iread_kb_pc += bytes >> 10;
+		ios->iread_b_pc += bytes & 1023;
+	}
+}
+
+static inline void account_pc_issue(struct blk_io_trace *t,
+				    struct per_cpu_info *pci, int rw)
+{
+	__account_pc_issue(&pci->io_stats, rw, t->bytes);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_pc_issue(ios, rw, t->bytes);
+	}
+}
+
+static inline void __account_pc_requeue(struct io_stats *ios,
+					struct blk_io_trace *t, int rw)
+{
+	if (rw) {
+		ios->wrqueue_pc++;
+		ios->iwrite_kb_pc -= t_kb(t);
+		ios->iwrite_b_pc -= t_b(t);
+	} else {
+		ios->rrqueue_pc++;
+		ios->iread_kb_pc -= t_kb(t);
+		ios->iread_b_pc -= t_b(t);
+	}
+}
+
+static inline void account_pc_requeue(struct blk_io_trace *t,
+				      struct per_cpu_info *pci, int rw)
+{
+	__account_pc_requeue(&pci->io_stats, t, rw);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_pc_requeue(ios, t, rw);
+	}
+}
+
+static inline void __account_pc_c(struct io_stats *ios, int rw)
+{
+	if (rw)
+		ios->cwrites_pc++;
+	else
+		ios->creads_pc++;
+}
+
+static inline void account_pc_c(struct blk_io_trace *t,
+				struct per_cpu_info *pci, int rw)
+{
+	__account_pc_c(&pci->io_stats, rw);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_pc_c(ios, rw);
+	}
+}
+
+static inline void __account_queue(struct io_stats *ios, struct blk_io_trace *t,
+				   int rw)
+{
+	if (rw) {
+		ios->qwrites++;
+		ios->qwrite_kb += t_kb(t);
+		ios->qwrite_b += t_b(t);
+	} else {
+		ios->qreads++;
+		ios->qread_kb += t_kb(t);
+		ios->qread_b += t_b(t);
+	}
+}
+
+static inline void account_queue(struct blk_io_trace *t,
+				 struct per_cpu_info *pci, int rw)
+{
+	__account_queue(&pci->io_stats, t, rw);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_queue(ios, t, rw);
+	}
+}
+
+static inline void __account_c(struct io_stats *ios, int rw, int bytes)
+{
+	if (rw) {
+		ios->cwrites++;
+		ios->cwrite_kb += bytes >> 10;
+		ios->cwrite_b += bytes & 1023;
+	} else {
+		ios->creads++;
+		ios->cread_kb += bytes >> 10;
+		ios->cread_b += bytes & 1023;
+	}
+}
+
+static inline void account_c(struct blk_io_trace *t, struct per_cpu_info *pci,
+			     int rw, int bytes)
+{
+	__account_c(&pci->io_stats, rw, bytes);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_c(ios, rw, bytes);
+	}
+}
+
+static inline void __account_issue(struct io_stats *ios, int rw,
+				   unsigned int bytes)
+{
+	if (rw) {
+		ios->iwrites++;
+		ios->iwrite_kb += bytes >> 10;
+		ios->iwrite_b  += bytes & 1023;
+	} else {
+		ios->ireads++;
+		ios->iread_kb += bytes >> 10;
+		ios->iread_b  += bytes & 1023;
+	}
+}
+
+static inline void account_issue(struct blk_io_trace *t,
+				 struct per_cpu_info *pci, int rw)
+{
+	__account_issue(&pci->io_stats, rw, t->bytes);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_issue(ios, rw, t->bytes);
+	}
+}
+
+static inline void __account_unplug(struct io_stats *ios, int timer)
+{
+	if (timer)
+		ios->timer_unplugs++;
+	else
+		ios->io_unplugs++;
+}
+
+static inline void account_unplug(struct blk_io_trace *t,
+				  struct per_cpu_info *pci, int timer)
+{
+	__account_unplug(&pci->io_stats, timer);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_unplug(ios, timer);
+	}
+}
+
+static inline void __account_requeue(struct io_stats *ios,
+				     struct blk_io_trace *t, int rw)
+{
+	if (rw) {
+		ios->wrqueue++;
+		ios->iwrite_kb -= t_kb(t);
+		ios->iwrite_b -= t_b(t);
+	} else {
+		ios->rrqueue++;
+		ios->iread_kb -= t_kb(t);
+		ios->iread_b -= t_b(t);
+	}
+}
+
+static inline void account_requeue(struct blk_io_trace *t,
+				   struct per_cpu_info *pci, int rw)
+{
+	__account_requeue(&pci->io_stats, t, rw);
+
+	if (per_process_stats) {
+		struct io_stats *ios = find_process_io_stats(t->pid);
+
+		__account_requeue(ios, t, rw);
+	}
+}
+
+static void log_complete(struct per_dev_info *pdi, struct per_cpu_info *pci,
+			 struct blk_io_trace *t, char *act)
+{
+	process_fmt(act, pci, t, log_track_complete(pdi, t), 0, NULL);
+}
+
+static void log_insert(struct per_dev_info *pdi, struct per_cpu_info *pci,
+		       struct blk_io_trace *t, char *act)
+{
+	process_fmt(act, pci, t, log_track_insert(pdi, t), 0, NULL);
+}
+
+static void log_queue(struct per_cpu_info *pci, struct blk_io_trace *t,
+		      char *act)
+{
+	process_fmt(act, pci, t, -1, 0, NULL);
+}
+
+static void log_issue(struct per_dev_info *pdi, struct per_cpu_info *pci,
+		      struct blk_io_trace *t, char *act)
+{
+	process_fmt(act, pci, t, log_track_issue(pdi, t), 0, NULL);
+}
+
+static void log_merge(struct per_dev_info *pdi, struct per_cpu_info *pci,
+		      struct blk_io_trace *t, char *act)
+{
+	if (act[0] == 'F')
+		log_track_frontmerge(pdi, t);
+
+	process_fmt(act, pci, t, -1ULL, 0, NULL);
+}
+
+static void log_action(struct per_cpu_info *pci, struct blk_io_trace *t,
+			char *act)
+{
+	process_fmt(act, pci, t, -1ULL, 0, NULL);
+}
+
+static void log_generic(struct per_cpu_info *pci, struct blk_io_trace *t,
+			char *act)
+{
+	process_fmt(act, pci, t, -1ULL, 0, NULL);
+}
+
+static void log_unplug(struct per_cpu_info *pci, struct blk_io_trace *t,
+		      char *act)
+{
+	process_fmt(act, pci, t, -1ULL, 0, NULL);
+}
+
+static void log_split(struct per_cpu_info *pci, struct blk_io_trace *t,
+		      char *act)
+{
+	process_fmt(act, pci, t, -1ULL, 0, NULL);
+}
+
+static void log_pc(struct per_cpu_info *pci, struct blk_io_trace *t, char *act)
+{
+	unsigned char *buf = (unsigned char *) t + sizeof(*t);
+
+	process_fmt(act, pci, t, -1ULL, t->pdu_len, buf);
+}
+
+static void dump_trace_pc(struct blk_io_trace *t, struct per_dev_info *pdi,
+			  struct per_cpu_info *pci)
+{
+	int w = (t->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+	int act = (t->action & 0xffff) & ~__BLK_TA_CGROUP;
+
+	switch (act) {
+		case __BLK_TA_QUEUE:
+			log_generic(pci, t, "Q");
+			account_pc_queue(t, pci, w);
 			break;
-
-		if (!match_trace(d->d_name, &n))
-			continue;
-
-		n += dlen + 1; /* dir + '/' + file */
-		/* Allocate space for tracelist + filename */
-		tl = calloc(1, sizeof(struct tracelist) + (sizeof(char) * (n + 1)));
-		if (!tl) {
-			closedir(dir);
-			return NULL;
-		}
-		tl->next = traces;
-		tl->name = (char *)(tl + 1);
-		snprintf(tl->name, n, "%s/%s", dir_name, d->d_name);
-		traces = tl;
-		count++;
+		case __BLK_TA_GETRQ:
+			log_generic(pci, t, "G");
+			break;
+		case __BLK_TA_SLEEPRQ:
+			log_generic(pci, t, "S");
+			break;
+		case __BLK_TA_REQUEUE:
+			/*
+			 * can happen if we miss traces, don't let it go
+			 * below zero
+			 */
+			if (pdi->cur_depth[w])
+				pdi->cur_depth[w]--;
+			account_pc_requeue(t, pci, w);
+			log_generic(pci, t, "R");
+			break;
+		case __BLK_TA_ISSUE:
+			account_pc_issue(t, pci, w);
+			pdi->cur_depth[w]++;
+			if (pdi->cur_depth[w] > pdi->max_depth[w])
+				pdi->max_depth[w] = pdi->cur_depth[w];
+			log_pc(pci, t, "D");
+			break;
+		case __BLK_TA_COMPLETE:
+			if (pdi->cur_depth[w])
+				pdi->cur_depth[w]--;
+			log_pc(pci, t, "C");
+			account_pc_c(t, pci, w);
+			break;
+		case __BLK_TA_INSERT:
+			log_pc(pci, t, "I");
+			break;
+		default:
+			fprintf(stderr, "Bad pc action %x\n", act);
+			break;
 	}
-
-	closedir(dir);
-
-	if (len)
-		*len = count;
-
-	return traces;
 }
 
-static void traces_free(struct tracelist *traces)
+static void dump_trace_fs(struct blk_io_trace *t, struct per_dev_info *pdi,
+			  struct per_cpu_info *pci)
 {
-	while (traces) {
-		struct tracelist *tl = traces;
-		traces = traces->next;
-		free(tl);
+	int w = (t->action & BLK_TC_ACT(BLK_TC_WRITE)) != 0;
+	int act = (t->action & 0xffff) & ~__BLK_TA_CGROUP;
+
+	switch (act) {
+		case __BLK_TA_QUEUE:
+			log_track_queue(pdi, t);
+			account_queue(t, pci, w);
+			log_queue(pci, t, "Q");
+			break;
+		case __BLK_TA_INSERT:
+			log_insert(pdi, pci, t, "I");
+			break;
+		case __BLK_TA_BACKMERGE:
+			account_m(t, pci, w);
+			log_merge(pdi, pci, t, "M");
+			break;
+		case __BLK_TA_FRONTMERGE:
+			account_m(t, pci, w);
+			log_merge(pdi, pci, t, "F");
+			break;
+		case __BLK_TA_GETRQ:
+			log_track_getrq(pdi, t);
+			log_generic(pci, t, "G");
+			break;
+		case __BLK_TA_SLEEPRQ:
+			log_generic(pci, t, "S");
+			break;
+		case __BLK_TA_REQUEUE:
+			/*
+			 * can happen if we miss traces, don't let it go
+			 * below zero
+			 */
+			if (pdi->cur_depth[w])
+				pdi->cur_depth[w]--;
+			account_requeue(t, pci, w);
+			log_queue(pci, t, "R");
+			break;
+		case __BLK_TA_ISSUE:
+			account_issue(t, pci, w);
+			pdi->cur_depth[w]++;
+			if (pdi->cur_depth[w] > pdi->max_depth[w])
+				pdi->max_depth[w] = pdi->cur_depth[w];
+			log_issue(pdi, pci, t, "D");
+			break;
+		case __BLK_TA_COMPLETE:
+			if (pdi->cur_depth[w])
+				pdi->cur_depth[w]--;
+			fixup_complete(pdi, t);
+			account_c(t, pci, w, t->bytes);
+			log_complete(pdi, pci, t, "C");
+			break;
+		case __BLK_TA_PLUG:
+			log_action(pci, t, "P");
+			break;
+		case __BLK_TA_UNPLUG_IO:
+			account_unplug(t, pci, 0);
+			log_unplug(pci, t, "U");
+			break;
+		case __BLK_TA_UNPLUG_TIMER:
+			account_unplug(t, pci, 1);
+			log_unplug(pci, t, "UT");
+			break;
+		case __BLK_TA_SPLIT:
+			log_track_split(pdi, t);
+			log_split(pci, t, "X");
+			break;
+		case __BLK_TA_BOUNCE:
+			log_generic(pci, t, "B");
+			break;
+		case __BLK_TA_REMAP:
+			log_generic(pci, t, "A");
+			break;
+		case __BLK_TA_DRV_DATA:
+			have_drv_data = 1;
+			/* dump to binary file only */
+			break;
+		default:
+			fprintf(stderr, "Bad fs action %x\n", t->action);
+			break;
 	}
 }
 
-static int dump_traces(struct tracelist *traces, int count, char *dumpfile)
+static void dump_trace(struct blk_io_trace *t, struct per_cpu_info *pci,
+		       struct per_dev_info *pdi)
 {
-	struct tracelist *tl;
-	char **argv = NULL;
-	int argc = 0;
-	int i;
-	int err = 0;
-
-	argc = count * 2; /* {"-i", trace } */
-	argc += 4; /* See below */
-	argv = calloc(argc + 1, sizeof(char *));
-	if (!argv)
-		return -errno;
-
-	i = 0;
-	argv[i++] = "blkparse";
-	argv[i++] = "-O";
-	argv[i++] = "-d";
-	argv[i++] = dumpfile;
-	for (tl = traces; tl != NULL; tl = tl->next) {
-		argv[i++] = "-i";
-		argv[i++] = tl->name;
+	if (text_output) {
+		if ((t->action & ~__BLK_TN_CGROUP) == BLK_TN_MESSAGE)
+			handle_notify(t);
+		else if (t->action & BLK_TC_ACT(BLK_TC_PC))
+			dump_trace_pc(t, pdi, pci);
+		else
+			dump_trace_fs(t, pdi, pci);
 	}
 
-	err = run_program(argc, argv, 1, NULL, NULL);
-	if (err)
-		fprintf(stderr, "%s exited with %d, expected 0\n", argv[0], err);
-	free(argv);
-	return err;
+	if (!pdi->events)
+		pdi->first_reported_time = t->time;
+
+	pdi->events++;
+
+	if (bin_output_msgs ||
+			    !(t->action & BLK_TC_ACT(BLK_TC_NOTIFY) &&
+			      (t->action & ~__BLK_TN_CGROUP) == BLK_TN_MESSAGE))
+		output_binary(t, sizeof(*t) + t->pdu_len);
 }
 
-static char *find_trace_file(char *filename)
+/*
+ * print in a proper way, not too small and not too big. if more than
+ * 1000,000K, turn into M and so on
+ */
+static char *size_cnv(char *dst, unsigned long long num, int in_kb)
 {
-	int ret;
-	struct stat st;
-	char *dot;
-	int found_dir = 0;
-	char *dumpfile;
-	int len = strlen(filename);
+	char suff[] = { '\0', 'K', 'M', 'G', 'P' };
+	unsigned int i = 0;
 
-	/* look for an exact match of whatever they pass in.
-	 * If it is a file, assume it is the dump file.
-	 * If a directory, remember that it existed so we
-	 * can combine traces in that directory later
-	 */
-	ret = stat(filename, &st);
-	if (ret == 0) {
-		if (S_ISREG(st.st_mode))
-			return strdup(filename);
+	if (in_kb)
+		i++;
 
-		if (S_ISDIR(st.st_mode))
-			found_dir = 1;
+	while (num > 1000 * 1000ULL && (i < sizeof(suff) - 1)) {
+		i++;
+		num /= 1000;
 	}
 
-	if (found_dir) {
-		int i;
-		/* Eat up trailing '/'s */
-		for (i = len - 1; filename[i] == '/'; i--)
-			filename[i] = '\0';
-	}
-
-	/*
-	 * try tacking .dump onto the end and see if that already
-	 * has been generated
-	 */
-	ret = asprintf(&dumpfile, "%s.dump", filename);
-	if (ret == -1) {
-		perror("Error building dump file name");
-		return NULL;
-	}
-	ret = stat(dumpfile, &st);
-	if (ret == 0)
-		return dumpfile;
-
-	/*
-	 * try to generate the .dump from all the traces in
-	 * a single dir.
-	 */
-	if (found_dir) {
-		int count;
-		struct tracelist *traces = traces_list(filename, &count);
-		if (traces) {
-			ret = dump_traces(traces, count, dumpfile);
-			traces_free(traces);
-			if (ret == 0)
-				return dumpfile;
-		}
-	}
-	free(dumpfile);
-
-	/*
-	 * try to generate the .dump from all the blktrace
-	 * files for a named trace
-	 */
-	dot = strrchr(filename, '.');
-	if (!dot || strcmp(".dump", dot) != 0) {
-		struct tracelist trace = {0 ,NULL};
-		if (dot && dot != filename)
-			len = dot - filename;
-
-		ret = asprintf(&trace.name, "%*s.blktrace.0", len, filename);
-		if (ret == -1)
-			return NULL;
-		ret = asprintf(&dumpfile, "%*s.dump", len, filename);
-		if (ret == -1) {
-			free(trace.name);
-			return NULL;
-		}
-
-		ret = dump_traces(&trace, 1, dumpfile);
-		if (ret == 0) {
-			free(trace.name);
-			return dumpfile;
-		}
-		free(trace.name);
-		free(dumpfile);
-	}
-	return NULL;
-}
-struct trace *open_trace(char *filename)
-{
-	int fd;
-	char *p;
-	struct stat st;
-	int ret;
-	struct trace *trace;
-	char *found_filename;
-
-	trace = calloc(1, sizeof(*trace));
-	if (!trace) {
-		fprintf(stderr, "unable to allocate memory for trace\n");
-		return NULL;
-	}
-
-	found_filename = find_trace_file(filename);
-	if (!found_filename) {
-		fprintf(stderr, "Unable to find trace file %s\n", filename);
-		goto fail;
-	}
-	filename = found_filename;
-
-	fd = open(filename, O_RDONLY);
-	if (fd < 0) {
-		fprintf(stderr, "Unable to open trace file %s err %s\n", filename, strerror(errno));
-		goto fail;
-	}
-	ret = fstat(fd, &st);
-	if (ret < 0) {
-		fprintf(stderr, "stat failed on %s err %s\n", filename, strerror(errno));
-		goto fail_fd;
-	}
-	p = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (p == MAP_FAILED) {
-		fprintf(stderr, "Unable to mmap trace file %s, err %s\n", filename, strerror(errno));
-		goto fail_fd;
-	}
-	trace->fd = fd;
-	trace->len = st.st_size;
-	trace->start = p;
-	trace->cur = p;
-	trace->io = (struct blk_io_trace *)p;
-	return trace;
-
-fail_fd:
-	close(fd);
-fail:
-	free(trace);
-	return NULL;
-}
-static inline int tput_event(struct trace *trace)
-{
-	if (trace->found_completion)
-		return __BLK_TA_COMPLETE;
-	if (trace->found_issue)
-		return __BLK_TA_ISSUE;
-	if (trace->found_queue)
-		return __BLK_TA_QUEUE;
-
-	return __BLK_TA_COMPLETE;
+	sprintf(dst, "%'8Lu%c", num, suff[i]);
+	return dst;
 }
 
-int action_char_to_num(char action)
+static void dump_io_stats(struct per_dev_info *pdi, struct io_stats *ios,
+			  char *msg)
 {
-	switch (action) {
-	case 'Q':
-		return __BLK_TA_QUEUE;
-	case 'D':
-		return __BLK_TA_ISSUE;
-	case 'C':
-		return __BLK_TA_COMPLETE;
+	static char x[256], y[256];
+
+	fprintf(ofp, "%s\n", msg);
+
+	fprintf(ofp, " Reads Queued:    %s, %siB\t",
+			size_cnv(x, ios->qreads, 0),
+			size_cnv(y, ios->qread_kb + (ios->qread_b>>10), 1));
+	fprintf(ofp, " Writes Queued:    %s, %siB\n",
+			size_cnv(x, ios->qwrites, 0),
+			size_cnv(y, ios->qwrite_kb + (ios->qwrite_b>>10), 1));
+	fprintf(ofp, " Read Dispatches: %s, %siB\t",
+			size_cnv(x, ios->ireads, 0),
+			size_cnv(y, ios->iread_kb + (ios->iread_b>>10), 1));
+	fprintf(ofp, " Write Dispatches: %s, %siB\n",
+			size_cnv(x, ios->iwrites, 0),
+			size_cnv(y, ios->iwrite_kb + (ios->iwrite_b>>10), 1));
+	fprintf(ofp, " Reads Requeued:  %s\t\t", size_cnv(x, ios->rrqueue, 0));
+	fprintf(ofp, " Writes Requeued:  %s\n", size_cnv(x, ios->wrqueue, 0));
+	fprintf(ofp, " Reads Completed: %s, %siB\t",
+			size_cnv(x, ios->creads, 0),
+			size_cnv(y, ios->cread_kb + (ios->cread_b>>10), 1));
+	fprintf(ofp, " Writes Completed: %s, %siB\n",
+			size_cnv(x, ios->cwrites, 0),
+			size_cnv(y, ios->cwrite_kb + (ios->cwrite_b>>10), 1));
+	fprintf(ofp, " Read Merges:     %s, %siB\t",
+			size_cnv(x, ios->mreads, 0),
+			size_cnv(y, ios->mread_kb + (ios->mread_b>>10), 1));
+	fprintf(ofp, " Write Merges:     %s, %siB\n",
+			size_cnv(x, ios->mwrites, 0),
+			size_cnv(y, ios->mwrite_kb + (ios->mwrite_b>>10), 1));
+	if (pdi) {
+		fprintf(ofp, " Read depth:      %'8u%8c\t", pdi->max_depth[0], ' ');
+		fprintf(ofp, " Write depth:      %'8u\n", pdi->max_depth[1]);
 	}
+	if (ios->qreads_pc || ios->qwrites_pc || ios->ireads_pc || ios->iwrites_pc ||
+	    ios->rrqueue_pc || ios->wrqueue_pc || ios->creads_pc || ios->cwrites_pc) {
+		fprintf(ofp, " PC Reads Queued: %s, %siB\t",
+			size_cnv(x, ios->qreads_pc, 0),
+			size_cnv(y,
+				ios->qread_kb_pc + (ios->qread_b_pc>>10), 1));
+		fprintf(ofp, " PC Writes Queued: %s, %siB\n",
+			size_cnv(x, ios->qwrites_pc, 0),
+			size_cnv(y,
+				ios->qwrite_kb_pc + (ios->qwrite_b_pc>>10), 1));
+		fprintf(ofp, " PC Read Disp.:   %s, %siB\t",
+			size_cnv(x, ios->ireads_pc, 0),
+			size_cnv(y,
+				ios->iread_kb_pc + (ios->iread_b_pc>>10), 1));
+		fprintf(ofp, " PC Write Disp.:   %s, %siB\n",
+			size_cnv(x, ios->iwrites_pc, 0),
+			size_cnv(y,
+				ios->iwrite_kb_pc + (ios->iwrite_b_pc>>10),
+				1));
+		fprintf(ofp, " PC Reads Req.:   %s\t\t", size_cnv(x, ios->rrqueue_pc, 0));
+		fprintf(ofp, " PC Writes Req.:   %s\n", size_cnv(x, ios->wrqueue_pc, 0));
+		fprintf(ofp, " PC Reads Compl.: %s\t\t", size_cnv(x, ios->creads_pc, 0));
+		fprintf(ofp, " PC Writes Compl.: %s\n", size_cnv(x, ios->cwrites_pc, 0));
+	}
+	fprintf(ofp, " IO unplugs:      %'8lu%8c\t", ios->io_unplugs, ' ');
+	fprintf(ofp, " Timer unplugs:    %'8lu\n", ios->timer_unplugs);
+}
+
+static void dump_wait_stats(struct per_process_info *ppi)
+{
+	unsigned long rawait = ppi->longest_allocation_wait[0] / 1000;
+	unsigned long rdwait = ppi->longest_dispatch_wait[0] / 1000;
+	unsigned long rcwait = ppi->longest_completion_wait[0] / 1000;
+	unsigned long wawait = ppi->longest_allocation_wait[1] / 1000;
+	unsigned long wdwait = ppi->longest_dispatch_wait[1] / 1000;
+	unsigned long wcwait = ppi->longest_completion_wait[1] / 1000;
+
+	fprintf(ofp, " Allocation wait: %'8lu%8c\t", rawait, ' ');
+	fprintf(ofp, " Allocation wait:  %'8lu\n", wawait);
+	fprintf(ofp, " Dispatch wait:   %'8lu%8c\t", rdwait, ' ');
+	fprintf(ofp, " Dispatch wait:    %'8lu\n", wdwait);
+	fprintf(ofp, " Completion wait: %'8lu%8c\t", rcwait, ' ');
+	fprintf(ofp, " Completion wait:  %'8lu\n", wcwait);
+}
+
+static int ppi_name_compare(const void *p1, const void *p2)
+{
+	struct per_process_info *ppi1 = *((struct per_process_info **) p1);
+	struct per_process_info *ppi2 = *((struct per_process_info **) p2);
+	int res;
+
+	res = strverscmp(ppi1->ppm->comm, ppi2->ppm->comm);
+	if (!res)
+		res = ppi1->ppm->pid > ppi2->ppm->pid;
+
+	return res;
+}
+
+static int ppi_event_compare(const void *p1, const void *p2)
+{
+	struct per_process_info *ppi1 = *((struct per_process_info **) p1);
+	struct per_process_info *ppi2 = *((struct per_process_info **) p2);
+	struct io_stats *ios1 = &ppi1->io_stats;
+	struct io_stats *ios2 = &ppi2->io_stats;
+	unsigned long io1, io2;
+	unsigned long long kb1,kb2;
+	int sort_by_kb = 1;
+
+	io1 = io2 = 0;
+	kb1 = kb2 = 0;
+
+	switch (per_process_stats_event) {
+	case SORT_PROG_EVENT_QKB: /* KB: Queued read and write */
+		kb1 = ios1->qwrite_kb + (ios1->qwrite_b>>10) +
+			ios1->qread_kb + (ios1->qread_b>>10);
+		kb2 = ios2->qwrite_kb + (ios2->qwrite_b>>10) +
+			ios2->qread_kb + (ios2->qread_b>>10);
+		break;
+	case SORT_PROG_EVENT_RKB: /* KB: Queued Read */
+		kb1 = ios1->qread_kb + (ios1->qread_b>>10);
+		kb2 = ios2->qread_kb + (ios2->qread_b>>10);
+		break;
+	case SORT_PROG_EVENT_WKB: /* KB: Queued Write */
+		kb1 = ios1->qwrite_kb + (ios1->qwrite_b>>10);
+		kb2 = ios2->qwrite_kb + (ios2->qwrite_b>>10);
+		break;
+	case SORT_PROG_EVENT_CKB: /* KB: Complete */
+		kb1 = ios1->cwrite_kb + (ios1->cwrite_b>>10) +
+			ios1->cread_kb + (ios1->cread_b>>10);
+		kb2 = ios2->cwrite_kb + (ios2->cwrite_b>>10) +
+			ios2->cread_kb + (ios2->cread_b>>10);
+		break;
+	case SORT_PROG_EVENT_QIO: /* IO: Queued read and write */
+		sort_by_kb = 0;
+		io1 = ios1->qreads + ios1->qwrites;
+		io2 = ios2->qreads + ios2->qwrites;
+		break;
+	case SORT_PROG_EVENT_RIO: /* IO: Queued Read */
+		sort_by_kb = 0;
+		io1 = ios1->qreads;
+		io2 = ios2->qreads;
+		break;
+	case SORT_PROG_EVENT_WIO: /* IO: Queued Write */
+		sort_by_kb = 0;
+		io1 = ios1->qwrites;
+		io2 = ios2->qwrites;
+		break;
+	case SORT_PROG_EVENT_CIO: /* IO: Complete */
+		sort_by_kb = 0;
+		io1 = ios1->creads + ios1->cwrites;
+		io2 = ios2->creads + ios2->cwrites;
+		break;
+	}
+
+
+	/* compare kb */
+	if (sort_by_kb) {
+		if (kb1 > kb2)
+			return 1;
+		else if (kb1 == kb2)
+			return 0;
+		return -1;
+	}
+
+	/* compare io */
+	if (io1 > io2)
+		return 1;
+	else if (io1 == io2)
+		return 0;
 	return -1;
 }
 
-static inline int io_event(struct trace *trace)
+static int ppi_compare(const void *p1, const void *p2)
 {
-	if (plot_io_action)
-		return plot_io_action;
-	if (trace->found_queue)
-		return __BLK_TA_QUEUE;
-	if (trace->found_issue)
-		return __BLK_TA_ISSUE;
-	if (trace->found_completion)
-		return __BLK_TA_COMPLETE;
+	if (per_process_stats_event == SORT_PROG_EVENT_N)
+		return ppi_name_compare(p1, p2);
 
-	return __BLK_TA_COMPLETE;
+	return ppi_event_compare(p1, p2);
 }
 
-void add_tput(struct trace *trace, struct graph_line_data *writes_gld,
-	      struct graph_line_data *reads_gld)
+static void sort_process_list(void)
 {
-	struct blk_io_trace *io = trace->io;
-	struct graph_line_data *gld;
-	int action = io->action & BLK_TA_MASK;
-	int seconds;
+	struct per_process_info **ppis;
+	struct per_process_info *ppi;
+	int i = 0;
 
-	if (io->action & BLK_TC_ACT(BLK_TC_NOTIFY))
-		return;
+	ppis = malloc(ppi_list_entries * sizeof(struct per_process_info *));
 
-	if (action != tput_event(trace))
-		return;
-
-	if (BLK_DATADIR(io->action) & BLK_TC_READ)
-		gld = reads_gld;
-	else
-		gld = writes_gld;
-
-	seconds = SECONDS(io->time);
-	gld->data[seconds].sum += io->bytes;
-
-	gld->data[seconds].count = 1;
-	if (gld->data[seconds].sum > gld->max)
-		gld->max = gld->data[seconds].sum;
-}
-
-#define GDD_PTR_ALLOC_STEP 16
-
-static struct pid_map *get_pid_map(struct trace_file *tf, u32 pid)
-{
-	struct pid_map *pm;
-
-	if (!io_per_process) {
-		if (!tf->io_plots)
-			tf->io_plots = 1;
-		return NULL;
+	ppi = ppi_list;
+	while (ppi) {
+		ppis[i++] = ppi;
+		ppi = ppi->list_next;
 	}
 
-	pm = process_hash_insert(pid, NULL);
-	/* New entry? */
-	if (!pm->index) {
-		if (tf->io_plots == tf->io_plots_allocated) {
-			tf->io_plots_allocated += GDD_PTR_ALLOC_STEP;
-			tf->gdd_reads = realloc(tf->gdd_reads, tf->io_plots_allocated * sizeof(struct graph_dot_data *));
-			if (!tf->gdd_reads)
-				abort();
-			tf->gdd_writes = realloc(tf->gdd_writes, tf->io_plots_allocated * sizeof(struct graph_dot_data *));
-			if (!tf->gdd_writes)
-				abort();
-			memset(tf->gdd_reads + tf->io_plots_allocated - GDD_PTR_ALLOC_STEP,
-			       0, GDD_PTR_ALLOC_STEP * sizeof(struct graph_dot_data *));
-			memset(tf->gdd_writes + tf->io_plots_allocated - GDD_PTR_ALLOC_STEP,
-			       0, GDD_PTR_ALLOC_STEP * sizeof(struct graph_dot_data *));
+	qsort(ppis, ppi_list_entries, sizeof(ppi), ppi_compare);
+
+	i = ppi_list_entries - 1;
+	ppi_list = NULL;
+	while (i >= 0) {
+		ppi = ppis[i];
+
+		ppi->list_next = ppi_list;
+		ppi_list = ppi;
+		i--;
+	}
+
+	free(ppis);
+}
+
+static void show_process_stats(void)
+{
+	struct per_process_info *ppi;
+
+	sort_process_list();
+
+	ppi = ppi_list;
+	while (ppi) {
+		struct process_pid_map *ppm = ppi->ppm;
+		char name[64];
+
+		if (ppi->more_than_one)
+			sprintf(name, "%s (%u, ...)", ppm->comm, ppm->pid);
+		else
+			sprintf(name, "%s (%u)", ppm->comm, ppm->pid);
+
+		dump_io_stats(NULL, &ppi->io_stats, name);
+		dump_wait_stats(ppi);
+		ppi = ppi->list_next;
+	}
+
+	fprintf(ofp, "\n");
+}
+
+static void show_device_and_cpu_stats(void)
+{
+	struct per_dev_info *pdi;
+	struct per_cpu_info *pci;
+	struct io_stats total, *ios;
+	unsigned long long rrate, wrate, msec;
+	int i, j, pci_events;
+	char line[3 + 8/*cpu*/ + 2 + 32/*dev*/ + 3];
+	char name[32];
+	double ratio;
+
+	for (pdi = devices, i = 0; i < ndevices; i++, pdi++) {
+
+		memset(&total, 0, sizeof(total));
+		pci_events = 0;
+
+		if (i > 0)
+			fprintf(ofp, "\n");
+
+		for (pci = pdi->cpus, j = 0; j < pdi->ncpus; j++, pci++) {
+			if (!pci->nelems)
+				continue;
+
+			ios = &pci->io_stats;
+			total.qreads += ios->qreads;
+			total.qwrites += ios->qwrites;
+			total.creads += ios->creads;
+			total.cwrites += ios->cwrites;
+			total.mreads += ios->mreads;
+			total.mwrites += ios->mwrites;
+			total.ireads += ios->ireads;
+			total.iwrites += ios->iwrites;
+			total.rrqueue += ios->rrqueue;
+			total.wrqueue += ios->wrqueue;
+			total.qread_kb += ios->qread_kb;
+			total.qwrite_kb += ios->qwrite_kb;
+			total.cread_kb += ios->cread_kb;
+			total.cwrite_kb += ios->cwrite_kb;
+			total.iread_kb += ios->iread_kb;
+			total.iwrite_kb += ios->iwrite_kb;
+			total.mread_kb += ios->mread_kb;
+			total.mwrite_kb += ios->mwrite_kb;
+			total.qread_b += ios->qread_b;
+			total.qwrite_b += ios->qwrite_b;
+			total.cread_b += ios->cread_b;
+			total.cwrite_b += ios->cwrite_b;
+			total.iread_b += ios->iread_b;
+			total.iwrite_b += ios->iwrite_b;
+			total.mread_b += ios->mread_b;
+			total.mwrite_b += ios->mwrite_b;
+
+			total.qreads_pc += ios->qreads_pc;
+			total.qwrites_pc += ios->qwrites_pc;
+			total.creads_pc += ios->creads_pc;
+			total.cwrites_pc += ios->cwrites_pc;
+			total.ireads_pc += ios->ireads_pc;
+			total.iwrites_pc += ios->iwrites_pc;
+			total.rrqueue_pc += ios->rrqueue_pc;
+			total.wrqueue_pc += ios->wrqueue_pc;
+			total.qread_kb_pc += ios->qread_kb_pc;
+			total.qwrite_kb_pc += ios->qwrite_kb_pc;
+			total.iread_kb_pc += ios->iread_kb_pc;
+			total.iwrite_kb_pc += ios->iwrite_kb_pc;
+			total.qread_b_pc += ios->qread_b_pc;
+			total.qwrite_b_pc += ios->qwrite_b_pc;
+			total.iread_b_pc += ios->iread_b_pc;
+			total.iwrite_b_pc += ios->iwrite_b_pc;
+
+			total.timer_unplugs += ios->timer_unplugs;
+			total.io_unplugs += ios->io_unplugs;
+
+			snprintf(line, sizeof(line) - 1, "CPU%d (%s):",
+				 j, get_dev_name(pdi, name, sizeof(name)));
+			dump_io_stats(pdi, ios, line);
+			pci_events++;
 		}
-		pm->index = tf->io_plots++;
 
-		return pm;
+		if (pci_events > 1) {
+			fprintf(ofp, "\n");
+			snprintf(line, sizeof(line) - 1, "Total (%s):",
+				 get_dev_name(pdi, name, sizeof(name)));
+			dump_io_stats(NULL, &total, line);
+		}
+
+		wrate = rrate = 0;
+		msec = (pdi->last_reported_time - pdi->first_reported_time) / 1000000;
+		if (msec) {
+			rrate = ((1000 * total.cread_kb) + total.cread_b) /
+									msec;
+			wrate = ((1000 * total.cwrite_kb) + total.cwrite_b) /
+									msec;
+		}
+
+		fprintf(ofp, "\nThroughput (R/W): %'LuKiB/s / %'LuKiB/s\n",
+			rrate, wrate);
+		fprintf(ofp, "Events (%s): %'Lu entries\n",
+			get_dev_name(pdi, line, sizeof(line)), pdi->events);
+
+		collect_pdi_skips(pdi);
+		if (!pdi->skips && !pdi->events)
+			ratio = 0.0;
+		else
+			ratio = 100.0 * ((double)pdi->seq_skips /
+					(double)(pdi->events + pdi->seq_skips));
+		fprintf(ofp, "Skips: %'lu forward (%'llu - %5.1lf%%)\n",
+			pdi->skips, pdi->seq_skips, ratio);
 	}
-	return pm;
 }
 
-void add_io(struct trace *trace, struct trace_file *tf)
+static void correct_abs_start_time(void)
 {
-	struct blk_io_trace *io = trace->io;
-	int action = io->action & BLK_TA_MASK;
-	u64 offset;
-	int index;
-	char *label;
-	struct pid_map *pm;
+	long delta = genesis_time - start_timestamp;
 
-	if (io->action & BLK_TC_ACT(BLK_TC_NOTIFY))
-		return;
+	abs_start_time.tv_sec  += SECONDS(delta);
+	abs_start_time.tv_nsec += NANO_SECONDS(delta);
+	if (abs_start_time.tv_nsec < 0) {
+		abs_start_time.tv_nsec += 1000000000;
+		abs_start_time.tv_sec -= 1;
+	} else
+	if (abs_start_time.tv_nsec > 1000000000) {
+		abs_start_time.tv_nsec -= 1000000000;
+		abs_start_time.tv_sec += 1;
+	}
+}
 
-	if (action != io_event(trace))
-		return;
+static void find_genesis(void)
+{
+	struct trace *t = trace_list;
 
-	offset = map_io(trace, io);
+	genesis_time = -1ULL;
+	while (t != NULL) {
+		if (t->bit->time < genesis_time)
+			genesis_time = t->bit->time;
 
-	pm = get_pid_map(tf, io->pid);
-	if (!pm) {
-		index = 0;
-		label = "";
+		t = t->next;
+	}
+
+	/* The time stamp record will usually be the first
+	 * record in the trace, but not always.
+	 */
+	if (start_timestamp
+	 && start_timestamp != genesis_time) {
+		correct_abs_start_time();
+	}
+}
+
+static inline int check_stopwatch(struct blk_io_trace *bit)
+{
+	if (bit->time < stopwatch_end &&
+	    bit->time >= stopwatch_start)
+		return 0;
+
+	return 1;
+}
+
+/*
+ * return youngest entry read
+ */
+static int sort_entries(unsigned long long *youngest)
+{
+	struct per_dev_info *pdi = NULL;
+	struct per_cpu_info *pci = NULL;
+	struct trace *t;
+
+	if (!genesis_time)
+		find_genesis();
+
+	*youngest = 0;
+	while ((t = trace_list) != NULL) {
+		struct blk_io_trace *bit = t->bit;
+
+		trace_list = t->next;
+
+		bit->time -= genesis_time;
+
+		if (bit->time < *youngest || !*youngest)
+			*youngest = bit->time;
+
+		if (!pdi || pdi->dev != bit->device) {
+			pdi = get_dev_info(bit->device);
+			pci = NULL;
+		}
+
+		if (!pci || pci->cpu != bit->cpu)
+			pci = get_cpu_info(pdi, bit->cpu);
+
+		if (bit->sequence < pci->smallest_seq_read)
+			pci->smallest_seq_read = bit->sequence;
+
+		if (check_stopwatch(bit)) {
+			bit_free(bit);
+			t_free(t);
+			continue;
+		}
+
+		if (trace_rb_insert_sort(t))
+			return -1;
+	}
+
+	return 0;
+}
+
+/*
+ * to continue, we must have traces from all online cpus in the tree
+ */
+static int check_cpu_map(struct per_dev_info *pdi)
+{
+	unsigned long *cpu_map;
+	struct rb_node *n;
+	struct trace *__t;
+	unsigned int i;
+	int ret, cpu;
+
+	/*
+	 * create a map of the cpus we have traces for
+	 */
+	cpu_map = malloc(pdi->cpu_map_max / sizeof(long));
+	memset(cpu_map, 0, sizeof(*cpu_map));
+	n = rb_first(&rb_sort_root);
+	while (n) {
+		__t = rb_entry(n, struct trace, rb_node);
+		cpu = __t->bit->cpu;
+
+		cpu_map[CPU_IDX(cpu)] |= (1UL << CPU_BIT(cpu));
+		n = rb_next(n);
+	}
+
+	/*
+	 * we can't continue if pdi->cpu_map has entries set that we don't
+	 * have in the sort rbtree. the opposite is not a problem, though
+	 */
+	ret = 0;
+	for (i = 0; i < pdi->cpu_map_max / CPUS_PER_LONG; i++) {
+		if (pdi->cpu_map[i] & ~(cpu_map[i])) {
+			ret = 1;
+			break;
+		}
+	}
+
+	free(cpu_map);
+	return ret;
+}
+
+static int check_sequence(struct per_dev_info *pdi, struct trace *t, int force)
+{
+	struct blk_io_trace *bit = t->bit;
+	unsigned long expected_sequence;
+	struct per_cpu_info *pci;
+	struct trace *__t;
+
+	pci = get_cpu_info(pdi, bit->cpu);
+	expected_sequence = pci->last_sequence + 1;
+
+	if (!expected_sequence) {
+		/*
+		 * 1 should be the first entry, just allow it
+		 */
+		if (bit->sequence == 1)
+			return 0;
+		if (bit->sequence == pci->smallest_seq_read)
+			return 0;
+
+		return check_cpu_map(pdi);
+	}
+
+	if (bit->sequence == expected_sequence)
+		return 0;
+
+	/*
+	 * we may not have seen that sequence yet. if we are not doing
+	 * the final run, break and wait for more entries.
+	 */
+	if (expected_sequence < pci->smallest_seq_read) {
+		__t = trace_rb_find_last(pdi, pci, expected_sequence);
+		if (!__t)
+			goto skip;
+
+		__put_trace_last(pdi, __t);
+		return 0;
+	} else if (!force) {
+		return 1;
 	} else {
-		index = pm->index;
-		label = pm->name;
-	}
-	if (BLK_DATADIR(io->action) & BLK_TC_READ) {
-		if (!tf->gdd_reads[index])
-			tf->gdd_reads[index] = alloc_dot_data(tf->min_seconds, tf->max_seconds, tf->min_offset, tf->max_offset, tf->stop_seconds, pick_color(), strdup(label));
-		set_gdd_bit(tf->gdd_reads[index], offset, io->bytes, io->time);
-	} else if (BLK_DATADIR(io->action) & BLK_TC_WRITE) {
-		if (!tf->gdd_writes[index])
-			tf->gdd_writes[index] = alloc_dot_data(tf->min_seconds, tf->max_seconds, tf->min_offset, tf->max_offset, tf->stop_seconds, pick_color(), strdup(label));
-		set_gdd_bit(tf->gdd_writes[index], offset, io->bytes, io->time);
+skip:
+		if (check_current_skips(pci, bit->sequence))
+			return 0;
+
+		if (expected_sequence < bit->sequence)
+			insert_skip(pci, expected_sequence, bit->sequence - 1);
+		return 0;
 	}
 }
 
-void add_pending_io(struct trace *trace, struct graph_line_data *gld)
+static void show_entries_rb(int force)
 {
-	unsigned int seconds;
-	struct blk_io_trace *io = trace->io;
-	int action = io->action & BLK_TA_MASK;
-	double avg;
-	struct pending_io *pio;
+	struct per_dev_info *pdi = NULL;
+	struct per_cpu_info *pci = NULL;
+	struct blk_io_trace *bit;
+	struct rb_node *n;
+	struct trace *t;
 
-	if (io->action & BLK_TC_ACT(BLK_TC_NOTIFY))
-		return;
+	while ((n = rb_first(&rb_sort_root)) != NULL) {
+		if (is_done() && !force && !pipeline)
+			break;
 
-	if (action == __BLK_TA_QUEUE) {
-		if (trace->found_issue || trace->found_completion)
-			hash_queued_io(trace->io);
-		return;
-	}
-	if (action == __BLK_TA_REQUEUE) {
-		if (ios_in_flight > 0)
-			ios_in_flight--;
-		return;
-	}
-	if (action != __BLK_TA_ISSUE)
-		return;
+		t = rb_entry(n, struct trace, rb_node);
+		bit = t->bit;
 
-	pio = hash_dispatched_io(trace->io);
-	if (!pio)
-		return;
+		if (read_sequence - t->read_sequence < 1 && !force)
+			break;
 
-	if (!trace->found_completion) {
-		list_del(&pio->hash_list);
-		free(pio);
-	}
+		if (!pdi || pdi->dev != bit->device) {
+			pdi = get_dev_info(bit->device);
+			pci = NULL;
+		}
 
-	ios_in_flight++;
+		if (!pdi) {
+			fprintf(stderr, "Unknown device ID? (%d,%d)\n",
+				MAJOR(bit->device), MINOR(bit->device));
+			break;
+		}
 
-	seconds = SECONDS(io->time);
-	gld->data[seconds].sum += ios_in_flight;
-	gld->data[seconds].count++;
+		if (!((bit->action & ~__BLK_TN_CGROUP) == BLK_TN_MESSAGE) &&
+		    check_sequence(pdi, t, force))
+			break;
 
-	avg = (double)gld->data[seconds].sum / gld->data[seconds].count;
-	if (gld->max < (u64)avg) {
-		gld->max = avg;
+		if (!force && bit->time > last_allowed_time)
+			break;
+
+		check_time(pdi, bit);
+
+		if (!pci || pci->cpu != bit->cpu)
+			pci = get_cpu_info(pdi, bit->cpu);
+
+		if (!((bit->action & ~__BLK_TN_CGROUP) == BLK_TN_MESSAGE))
+			pci->last_sequence = bit->sequence;
+
+		pci->nelems++;
+
+		if (bit->action & (act_mask << BLK_TC_SHIFT))
+			dump_trace(bit, pci, pdi);
+
+		put_trace(pdi, t);
 	}
 }
 
-void add_completed_io(struct trace *trace,
-		      struct graph_line_data *latency_gld)
+static int read_data(int fd, void *buffer, int bytes, int block, int *fdblock)
 {
-	struct blk_io_trace *io = trace->io;
-	int seconds;
-	int action = io->action & BLK_TA_MASK;
-	struct pending_io *pio;
-	double avg;
-	u64 latency;
+	int ret, bytes_left, fl;
+	void *p;
 
-	if (io->action & BLK_TC_ACT(BLK_TC_NOTIFY))
-		return;
+	if (block != *fdblock) {
+		fl = fcntl(fd, F_GETFL);
 
-	if (action != __BLK_TA_COMPLETE)
-		return;
-
-	seconds = SECONDS(io->time);
-
-	pio = hash_completed_io(trace->io);
-	if (!pio)
-		return;
-
-	if (ios_in_flight > 0)
-		ios_in_flight--;
-	if (io->time >= pio->dispatch_time) {
-		latency = io->time - pio->dispatch_time;
-		latency_gld->data[seconds].sum += latency;
-		latency_gld->data[seconds].count++;
+		if (!block) {
+			*fdblock = 0;
+			fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+		} else {
+			*fdblock = 1;
+			fcntl(fd, F_SETFL, fl & ~O_NONBLOCK);
+		}
 	}
 
-	list_del(&pio->hash_list);
-	free(pio);
+	bytes_left = bytes;
+	p = buffer;
+	while (bytes_left > 0) {
+		ret = read(fd, p, bytes_left);
+		if (!ret)
+			return 1;
+		else if (ret < 0) {
+			if (errno != EAGAIN) {
+				perror("read");
+				return -1;
+			}
 
-	avg = (double)latency_gld->data[seconds].sum /
-		latency_gld->data[seconds].count;
-	if (latency_gld->max < (u64)avg) {
-		latency_gld->max = avg;
+			/*
+			 * never do partial reads. we can return if we
+			 * didn't read anything and we should not block,
+			 * otherwise wait for data
+			 */
+			if ((bytes_left == bytes) && !block)
+				return 1;
+
+			usleep(10);
+			continue;
+		} else {
+			p += ret;
+			bytes_left -= ret;
+		}
+	}
+
+	return 0;
+}
+
+static inline __u16 get_pdulen(struct blk_io_trace *bit)
+{
+	if (data_is_native)
+		return bit->pdu_len;
+
+	return __bswap_16(bit->pdu_len);
+}
+
+static inline __u32 get_magic(struct blk_io_trace *bit)
+{
+	if (data_is_native)
+		return bit->magic;
+
+	return __bswap_32(bit->magic);
+}
+
+static int read_events(int fd, int always_block, int *fdblock)
+{
+	struct per_dev_info *pdi = NULL;
+	unsigned int events = 0;
+
+	while (!is_done() && events < rb_batch) {
+		struct blk_io_trace *bit;
+		struct trace *t;
+		int pdu_len, should_block, ret;
+		__u32 magic;
+
+		bit = bit_alloc();
+
+		should_block = !events || always_block;
+
+		ret = read_data(fd, bit, sizeof(*bit), should_block, fdblock);
+		if (ret) {
+			bit_free(bit);
+			if (!events && ret < 0)
+				events = ret;
+			break;
+		}
+
+		/*
+		 * look at first trace to check whether we need to convert
+		 * data in the future
+		 */
+		if (data_is_native == -1 && check_data_endianness(bit->magic))
+			break;
+
+		magic = get_magic(bit);
+		if ((magic & 0xffffff00) != BLK_IO_TRACE_MAGIC) {
+			fprintf(stderr, "Bad magic %x\n", magic);
+			break;
+		}
+
+		pdu_len = get_pdulen(bit);
+		if (pdu_len) {
+			void *ptr = realloc(bit, sizeof(*bit) + pdu_len);
+
+			if (read_data(fd, ptr + sizeof(*bit), pdu_len, 1, fdblock)) {
+				bit_free(ptr);
+				break;
+			}
+
+			bit = ptr;
+		}
+
+		trace_to_cpu(bit);
+
+		if (verify_trace(bit)) {
+			bit_free(bit);
+			continue;
+		}
+
+		/*
+		 * not a real trace, so grab and handle it here
+		 */
+		if (bit->action & BLK_TC_ACT(BLK_TC_NOTIFY) && (bit->action & ~__BLK_TN_CGROUP) != BLK_TN_MESSAGE) {
+			handle_notify(bit);
+			output_binary(bit, sizeof(*bit) + bit->pdu_len);
+			continue;
+		}
+
+		t = t_alloc();
+		memset(t, 0, sizeof(*t));
+		t->bit = bit;
+		t->read_sequence = read_sequence;
+
+		t->next = trace_list;
+		trace_list = t;
+
+		if (!pdi || pdi->dev != bit->device)
+			pdi = get_dev_info(bit->device);
+
+		if (bit->time > pdi->last_read_time)
+			pdi->last_read_time = bit->time;
+
+		events++;
+	}
+
+	return events;
+}
+
+/*
+ * Managing input streams
+ */
+
+struct ms_stream {
+	struct ms_stream *next;
+	struct trace *first, *last;
+	struct per_dev_info *pdi;
+	unsigned int cpu;
+};
+
+#define MS_HASH(d, c) ((MAJOR(d) & 0xff) ^ (MINOR(d) & 0xff) ^ (cpu & 0xff))
+
+struct ms_stream *ms_head;
+struct ms_stream *ms_hash[256];
+
+static void ms_sort(struct ms_stream *msp);
+static int ms_prime(struct ms_stream *msp);
+
+static inline struct trace *ms_peek(struct ms_stream *msp)
+{
+	return (msp == NULL) ? NULL : msp->first;
+}
+
+static inline __u64 ms_peek_time(struct ms_stream *msp)
+{
+	return ms_peek(msp)->bit->time;
+}
+
+static inline void ms_resort(struct ms_stream *msp)
+{
+	if (msp->next && ms_peek_time(msp) > ms_peek_time(msp->next)) {
+		ms_head = msp->next;
+		msp->next = NULL;
+		ms_sort(msp);
 	}
 }
 
-void add_iop(struct trace *trace, struct graph_line_data *gld)
+static inline void ms_deq(struct ms_stream *msp)
 {
-	struct blk_io_trace *io = trace->io;
-	int action = io->action & BLK_TA_MASK;
-	int seconds;
+	msp->first = msp->first->next;
+	if (!msp->first) {
+		msp->last = NULL;
+		if (!ms_prime(msp)) {
+			ms_head = msp->next;
+			msp->next = NULL;
+			return;
+		}
+	}
 
-	if (io->action & BLK_TC_ACT(BLK_TC_NOTIFY))
-		return;
-
-	/* iops and tput use the same events */
-	if (action != tput_event(trace))
-		return;
-
-	seconds = SECONDS(io->time);
-	gld->data[seconds].sum += 1;
-	gld->data[seconds].count = 1;
-	if (gld->data[seconds].sum > gld->max)
-		gld->max = gld->data[seconds].sum;
+	ms_resort(msp);
 }
 
-void check_record(struct trace *trace)
+static void ms_sort(struct ms_stream *msp)
 {
-	handle_notify(trace);
+	__u64 msp_t = ms_peek_time(msp);
+	struct ms_stream *this_msp = ms_head;
+
+	if (this_msp == NULL)
+		ms_head = msp;
+	else if (msp_t < ms_peek_time(this_msp)) {
+		msp->next = this_msp;
+		ms_head = msp;
+	}
+	else {
+		while (this_msp->next && ms_peek_time(this_msp->next) < msp_t)
+			this_msp = this_msp->next;
+
+		msp->next = this_msp->next;
+		this_msp->next = msp;
+	}
 }
+
+static int ms_prime(struct ms_stream *msp)
+{
+	__u32 magic;
+	unsigned int i;
+	struct trace *t;
+	struct per_dev_info *pdi = msp->pdi;
+	struct per_cpu_info *pci = get_cpu_info(pdi, msp->cpu);
+	struct blk_io_trace *bit = NULL;
+	int ret, pdu_len, ndone = 0;
+
+	for (i = 0; !is_done() && pci->fd >= 0 && i < rb_batch; i++) {
+		bit = bit_alloc();
+		ret = read_data(pci->fd, bit, sizeof(*bit), 1, &pci->fdblock);
+		if (ret)
+			goto err;
+
+		if (data_is_native == -1 && check_data_endianness(bit->magic))
+			goto err;
+
+		magic = get_magic(bit);
+		if ((magic & 0xffffff00) != BLK_IO_TRACE_MAGIC) {
+			fprintf(stderr, "Bad magic %x\n", magic);
+			goto err;
+
+		}
+
+		pdu_len = get_pdulen(bit);
+		if (pdu_len) {
+			void *ptr = realloc(bit, sizeof(*bit) + pdu_len);
+			ret = read_data(pci->fd, ptr + sizeof(*bit), pdu_len,
+							     1, &pci->fdblock);
+			if (ret) {
+				free(ptr);
+				bit = NULL;
+				goto err;
+			}
+
+			bit = ptr;
+		}
+
+		trace_to_cpu(bit);
+		if (verify_trace(bit))
+			goto err;
+
+		if (bit->cpu != pci->cpu) {
+			fprintf(stderr, "cpu %d trace info has error cpu %d\n",
+				pci->cpu, bit->cpu);
+			continue;
+		}
+
+		if (bit->action & BLK_TC_ACT(BLK_TC_NOTIFY) && (bit->action & ~__BLK_TN_CGROUP) != BLK_TN_MESSAGE) {
+			handle_notify(bit);
+			output_binary(bit, sizeof(*bit) + bit->pdu_len);
+			bit_free(bit);
+
+			i -= 1;
+			continue;
+		}
+
+		if (bit->time > pdi->last_read_time)
+			pdi->last_read_time = bit->time;
+
+		t = t_alloc();
+		memset(t, 0, sizeof(*t));
+		t->bit = bit;
+
+		if (msp->first == NULL)
+			msp->first = msp->last = t;
+		else {
+			msp->last->next = t;
+			msp->last = t;
+		}
+
+		ndone++;
+	}
+
+	return ndone;
+
+err:
+	if (bit) bit_free(bit);
+
+	cpu_mark_offline(pdi, pci->cpu);
+	close(pci->fd);
+	pci->fd = -1;
+
+	return ndone;
+}
+
+static struct ms_stream *ms_alloc(struct per_dev_info *pdi, int cpu)
+{
+	struct ms_stream *msp = malloc(sizeof(*msp));
+
+	msp->next = NULL;
+	msp->first = msp->last = NULL;
+	msp->pdi = pdi;
+	msp->cpu = cpu;
+
+	if (ms_prime(msp))
+		ms_sort(msp);
+
+	return msp;
+}
+
+static int setup_file(struct per_dev_info *pdi, int cpu)
+{
+	int len = 0;
+	struct stat st;
+	char *p, *dname;
+	struct per_cpu_info *pci = get_cpu_info(pdi, cpu);
+
+	pci->cpu = cpu;
+	pci->fdblock = -1;
+
+	p = strdup(pdi->name);
+	dname = dirname(p);
+	if (strcmp(dname, ".")) {
+		input_dir = dname;
+		p = strdup(pdi->name);
+		strcpy(pdi->name, basename(p));
+	}
+	free(p);
+
+	if (input_dir)
+		len = sprintf(pci->fname, "%s/", input_dir);
+
+	snprintf(pci->fname + len, sizeof(pci->fname)-1-len,
+		 "%s.blktrace.%d", pdi->name, pci->cpu);
+	if (stat(pci->fname, &st) < 0)
+		return 0;
+	if (!st.st_size)
+		return 1;
+
+	pci->fd = open(pci->fname, O_RDONLY);
+	if (pci->fd < 0) {
+		perror(pci->fname);
+		return 0;
+	}
+
+	printf("Input file %s added\n", pci->fname);
+	cpu_mark_online(pdi, pci->cpu);
+
+	pdi->nfiles++;
+	ms_alloc(pdi, pci->cpu);
+
+	return 1;
+}
+
+static int handle(struct ms_stream *msp)
+{
+	struct trace *t;
+	struct per_dev_info *pdi;
+	struct per_cpu_info *pci;
+	struct blk_io_trace *bit;
+
+	t = ms_peek(msp);
+
+	bit = t->bit;
+	pdi = msp->pdi;
+	pci = get_cpu_info(pdi, msp->cpu);
+	pci->nelems++;
+	bit->time -= genesis_time;
+
+	if (t->bit->time > stopwatch_end)
+		return 0;
+
+	pdi->last_reported_time = bit->time;
+	if ((bit->action & (act_mask << BLK_TC_SHIFT))&&
+	    t->bit->time >= stopwatch_start)
+		dump_trace(bit, pci, pdi);
+
+	ms_deq(msp);
+
+	if (text_output)
+		trace_rb_insert_last(pdi, t);
+	else {
+		bit_free(t->bit);
+		t_free(t);
+	}
+
+	return 1;
+}
+
+/*
+ * Check if we need to sanitize the name. We allow 'foo', or if foo.blktrace.X
+ * is given, then strip back down to 'foo' to avoid missing files.
+ */
+static int name_fixup(char *name)
+{
+	char *b;
+
+	if (!name)
+		return 1;
+
+	b = strstr(name, ".blktrace.");
+	if (b)
+		*b = '\0';
+
+	return 0;
+}
+
+static int do_file(void)
+{
+	int i, cpu, ret;
+	struct per_dev_info *pdi;
+
+	/*
+	 * first prepare all files for reading
+	 */
+	for (i = 0; i < ndevices; i++) {
+		pdi = &devices[i];
+		ret = name_fixup(pdi->name);
+		if (ret)
+			return ret;
+
+		for (cpu = 0; setup_file(pdi, cpu); cpu++)
+			;
+
+		if (!cpu) {
+			fprintf(stderr,"No input files found for %s\n",
+				pdi->name);
+			return 1;
+		}
+	}
+
+	/*
+	 * Get the initial time stamp
+	 */
+	if (ms_head)
+		genesis_time = ms_peek_time(ms_head);
+
+	/*
+	 * Correct abs_start_time if necessary
+	 */
+	if (start_timestamp
+	 && start_timestamp != genesis_time) {
+		correct_abs_start_time();
+	}
+
+	/*
+	 * Keep processing traces while any are left
+	 */
+	while (!is_done() && ms_head && handle(ms_head))
+		;
+
+	return 0;
+}
+
+static void do_pipe(int fd)
+{
+	unsigned long long youngest;
+	int events, fdblock;
+
+	last_allowed_time = -1ULL;
+	fdblock = -1;
+	while ((events = read_events(fd, 0, &fdblock)) > 0) {
+		read_sequence++;
+	
+#if 0
+		smallest_seq_read = -1U;
+#endif
+
+		if (sort_entries(&youngest))
+			break;
+
+		if (youngest > stopwatch_end)
+			break;
+
+		show_entries_rb(0);
+	}
+
+	if (rb_sort_entries)
+		show_entries_rb(1);
+}
+
+int do_fifo(void)
+{
+	int fd;
+
+	if (!strcmp(pipename, "-"))
+		fd = dup(STDIN_FILENO);
+	else
+		fd = open(pipename, O_RDONLY);
+
+	if (fd == -1) {
+		perror("dup stdin");
+		return -1;
+	}
+
+	do_pipe(fd);
+	close(fd);
+	return 0;
+}
+
+void show_stats(void)
+{
+	if (!ofp)
+		return;
+	if (stats_printed)
+		return;
+
+	stats_printed = 1;
+
+	if (per_process_stats)
+		show_process_stats();
+
+	if (per_device_and_cpu_stats)
+		show_device_and_cpu_stats();
+	fprintf(ofp, "Trace started at %s\n", ctime(&abs_start_time.tv_sec));
+
+	fflush(ofp);
+}
+
+void handle_sigint(__attribute__((__unused__)) int sig)
+{
+	done = 1;
+}
+
+/*
+ * Extract start and duration times from a string, allowing
+ * us to specify a time interval of interest within a trace.
+ * Format: "duration" (start is zero) or "start:duration".
+ */
+static int find_stopwatch_interval(char *string)
+{
+	double value;
+	char *sp;
+
+	value = strtod(string, &sp);
+	if (sp == string) {
+		fprintf(stderr,"Invalid stopwatch timer: %s\n", string);
+		return 1;
+	}
+	if (*sp == ':') {
+		stopwatch_start = DOUBLE_TO_NANO_ULL(value);
+		string = sp + 1;
+		value = strtod(string, &sp);
+		if (sp == string || *sp != '\0') {
+			fprintf(stderr,"Invalid stopwatch duration time: %s\n",
+				string);
+			return 1;
+		}
+	} else if (*sp != '\0') {
+		fprintf(stderr,"Invalid stopwatch start timer: %s\n", string);
+		return 1;
+	}
+	stopwatch_end = DOUBLE_TO_NANO_ULL(value);
+	if (stopwatch_end <= stopwatch_start) {
+		fprintf(stderr, "Invalid stopwatch interval: %Lu -> %Lu\n",
+			stopwatch_start, stopwatch_end);
+		return 1;
+	}
+
+	return 0;
+}
+
+int is_pipe(const char *str)
+{
+	struct stat st;
+
+	if (!strcmp(str, "-"))
+		return 1;
+	if (!stat(str, &st) && S_ISFIFO(st.st_mode))
+		return 1;
+
+	return 0;
+}
+
+static int get_program_sort_event(const char *str)
+{
+	char evt = str[0];
+
+	switch (evt) {
+	case 'N':
+		per_process_stats_event = SORT_PROG_EVENT_N;
+		break;
+	case 'Q':
+		per_process_stats_event = SORT_PROG_EVENT_QKB;
+		break;
+	case 'q':
+		per_process_stats_event = SORT_PROG_EVENT_QIO;
+		break;
+	case 'R':
+		per_process_stats_event = SORT_PROG_EVENT_RKB;
+		break;
+	case 'r':
+		per_process_stats_event = SORT_PROG_EVENT_RIO;
+		break;
+	case 'W':
+		per_process_stats_event = SORT_PROG_EVENT_WKB;
+		break;
+	case 'w':
+		per_process_stats_event = SORT_PROG_EVENT_WIO;
+		break;
+	case 'C':
+		per_process_stats_event = SORT_PROG_EVENT_CKB;
+		break;
+	case 'c':
+		per_process_stats_event = SORT_PROG_EVENT_CIO;
+		break;
+	default:
+		return 1;
+	}
+
+	return 0;
+}
+
+#define S_OPTS  "a:A:b:D:d:f:F:hi:o:OqsS:tw:vVM"
+static char usage_str[] =    "\n\n" \
+	"-i <file>           | --input=<file>\n" \
+	"[ -a <action field> | --act-mask=<action field> ]\n" \
+	"[ -A <action mask>  | --set-mask=<action mask> ]\n" \
+	"[ -b <traces>       | --batch=<traces> ]\n" \
+	"[ -d <file>         | --dump-binary=<file> ]\n" \
+	"[ -D <dir>          | --input-directory=<dir> ]\n" \
+	"[ -f <format>       | --format=<format> ]\n" \
+	"[ -F <spec>         | --format-spec=<spec> ]\n" \
+	"[ -h                | --hash-by-name ]\n" \
+	"[ -o <file>         | --output=<file> ]\n" \
+	"[ -O                | --no-text-output ]\n" \
+	"[ -q                | --quiet ]\n" \
+	"[ -s                | --per-program-stats ]\n" \
+	"[ -S <event>        | --sort-program-stats=<event> ]\n" \
+	"[ -t                | --track-ios ]\n" \
+	"[ -w <time>         | --stopwatch=<time> ]\n" \
+	"[ -M                | --no-msgs\n" \
+	"[ -v                | --verbose ]\n" \
+	"[ -V                | --version ]\n\n" \
+	"\t-a Only trace specified actions. See documentation\n" \
+	"\t-A Give trace mask as a single value. See documentation\n" \
+	"\t-b stdin read batching\n" \
+	"\t-d Output file. If specified, binary data is written to file\n" \
+	"\t-D Directory to prepend to input file names\n" \
+	"\t-f Output format. Customize the output format. The format field\n" \
+	"\t   identifies can be found in the documentation\n" \
+	"\t-F Format specification. Can be found in the documentation\n" \
+	"\t-h Hash processes by name, not pid\n" \
+	"\t-i Input file containing trace data, or '-' for stdin\n" \
+	"\t-o Output file. If not given, output is stdout\n" \
+	"\t-O Do NOT output text data\n" \
+	"\t-q Quiet. Don't display any stats at the end of the trace\n" \
+	"\t-s Show per-program io statistics\n" \
+	"\t-S Show per-program io statistics sorted by N/Q/q/R/r/W/w/C/c\n" \
+	"\t   N:Name, Q/q:Queued(read & write), R/r:Queued Read, W/w:Queued Write, C/c:Complete.\n" \
+	"\t   Sort programs by how much data(KB): Q,R,W,C.\n" \
+	"\t   Sort programs by how many IO operations: q,r,w,c.\n" \
+	"\t   if -S was used, the -s parameter will be ignored.\n" \
+	"\t-t Track individual ios. Will tell you the time a request took\n" \
+	"\t   to get queued, to get dispatched, and to get completed\n" \
+	"\t-w Only parse data between the given time interval in seconds.\n" \
+	"\t   If 'start' isn't given, blkparse defaults the start time to 0\n" \
+	"\t-M Do not output messages to binary file\n" \
+	"\t-v More verbose for marginal errors\n" \
+	"\t-V Print program version info\n\n";
+
+static void usage(char *prog)
+{
+	fprintf(stderr, "Usage: %s %s", prog, usage_str);
+}
+
+// int main(int argc, char *argv[])
+// {
+// 	int i, c, ret, mode;
+// 	int act_mask_tmp = 0;
+// 	char *ofp_buffer = NULL;
+// 	char *bin_ofp_buffer = NULL;
+
+// 	while ((c = getopt_long(argc, argv, S_OPTS, l_opts, NULL)) != -1) {
+// 		switch (c) {
+// 		case 'a':
+// 			i = find_mask_map(optarg);
+// 			if (i < 0) {
+// 				fprintf(stderr,"Invalid action mask %s\n",
+// 					optarg);
+// 				return 1;
+// 			}
+// 			act_mask_tmp |= i;
+// 			break;
+
+// 		case 'A':
+// 			if ((sscanf(optarg, "%x", &i) != 1) || 
+// 							!valid_act_opt(i)) {
+// 				fprintf(stderr,
+// 					"Invalid set action mask %s/0x%x\n",
+// 					optarg, i);
+// 				return 1;
+// 			}
+// 			act_mask_tmp = i;
+// 			break;
+// 		case 'i':
+// 			if (is_pipe(optarg) && !pipeline) {
+// 				pipeline = 1;
+// 				pipename = strdup(optarg);
+// 			} else if (resize_devices(optarg) != 0)
+// 				return 1;
+// 			break;
+// 		case 'D':
+// 			input_dir = optarg;
+// 			break;
+// 		case 'o':
+// 			output_name = optarg;
+// 			break;
+// 		case 'O':
+// 			text_output = 0;
+// 			break;
+// 		case 'b':
+// 			rb_batch = atoi(optarg);
+// 			if (rb_batch <= 0)
+// 				rb_batch = RB_BATCH_DEFAULT;
+// 			break;
+// 		case 's':
+// 			per_process_stats = 1;
+// 			break;
+// 		case 'S':
+// 			per_process_stats = 1;
+// 			if (get_program_sort_event(optarg))
+// 				return 1;
+// 			break;
+// 		case 't':
+// 			track_ios = 1;
+// 			break;
+// 		case 'q':
+// 			per_device_and_cpu_stats = 0;
+// 			break;
+// 		case 'w':
+// 			if (find_stopwatch_interval(optarg) != 0)
+// 				return 1;
+// 			break;
+// 		case 'f':
+// 			set_all_format_specs(optarg);
+// 			break;
+// 		case 'F':
+// 			if (add_format_spec(optarg) != 0)
+// 				return 1;
+// 			break;
+// 		case 'h':
+// 			ppi_hash_by_pid = 0;
+// 			break;
+// 		case 'v':
+// 			verbose++;
+// 			break;
+// 		case 'V':
+// 			printf("%s version %s\n", argv[0], blkparse_version);
+// 			return 0;
+// 		case 'd':
+// 			dump_binary = optarg;
+// 			break;
+// 		case 'M':
+// 			bin_output_msgs = 0;
+// 			break;
+// 		default:
+// 			usage(argv[0]);
+// 			return 1;
+// 		}
+// 	}
+
+// 	while (optind < argc) {
+// 		if (is_pipe(argv[optind]) && !pipeline) {
+// 			pipeline = 1;
+// 			pipename = strdup(argv[optind]);
+// 		} else if (resize_devices(argv[optind]) != 0)
+// 			return 1;
+// 		optind++;
+// 	}
+
+// 	if (!pipeline && !ndevices) {
+// 		usage(argv[0]);
+// 		return 1;
+// 	}
+
+// 	if (act_mask_tmp != 0)
+// 		act_mask = act_mask_tmp;
+
+// 	memset(&rb_sort_root, 0, sizeof(rb_sort_root));
+
+// 	signal(SIGINT, handle_sigint);
+// 	signal(SIGHUP, handle_sigint);
+// 	signal(SIGTERM, handle_sigint);
+
+// 	setlocale(LC_NUMERIC, "en_US");
+
+	// if (text_output) {
+	// 	if (!output_name) {
+	// 		ofp = fdopen(STDOUT_FILENO, "w");
+	// 		mode = _IOLBF;
+	// 	} else {
+	// 		char ofname[PATH_MAX];
+
+	// 		snprintf(ofname, sizeof(ofname) - 1, "%s", output_name);
+	// 		ofp = fopen(ofname, "w");
+	// 		mode = _IOFBF;
+	// 	}
+
+	// 	if (!ofp) {
+	// 		perror("fopen");
+	// 		return 1;
+	// 	}
+
+	// 	ofp_buffer = malloc(4096);
+	// 	if (setvbuf(ofp, ofp_buffer, mode, 4096)) {
+	// 		perror("setvbuf");
+	// 		return 1;
+	// 	}
+	// }
+
+// 	if (dump_binary) {
+// 		if (!strcmp(dump_binary, "-"))
+// 			dump_fp = stdout;
+// 		else {
+// 			dump_fp = fopen(dump_binary, "w");
+// 			if (!dump_fp) {
+// 				perror(dump_binary);
+// 				dump_binary = NULL;
+// 				return 1;
+// 			}
+// 		}
+// 		bin_ofp_buffer = malloc(128 * 1024);
+// 		if (setvbuf(dump_fp, bin_ofp_buffer, _IOFBF, 128 * 1024)) {
+// 			perror("setvbuf binary");
+// 			return 1;
+// 		}
+// 	}
+
+// 	if (pipeline)
+// 		ret = do_fifo();
+// 	else
+// 		ret = do_file();
+
+// 	if (!ret)
+// 		show_stats();
+
+// 	if (have_drv_data && !dump_binary)
+// 		printf("\ndiscarded traces containing low-level device driver "
+// 		       "specific data (only available in binary output)\n");
+
+// 	if (ofp_buffer) {
+// 		fflush(ofp);
+// 		free(ofp_buffer);
+// 	}
+// 	if (bin_ofp_buffer) {
+// 		fflush(dump_fp);
+// 		free(bin_ofp_buffer);
+// 	}
+// 	return ret;
+// }

@@ -1,0 +1,8 @@
+blkparse.o: blkparse.c blktrace.h blktrace_api.h rbtree.h jhash.h \
+ blkparse.h
+blkparse_fmt.o: blkparse_fmt.c blktrace.h blktrace_api.h rbtree.h
+blktrace.o: blktrace.c list.h blktrace.h blktrace_api.h rbtree.h
+main.o: main.c list.h tracers.h rbtree.h blktrace.h blktrace_api.h \
+ blkparse.h blkparse_fmt.h
+rbtree.o: rbtree.c rbtree.h
+tracers.o: tracers.c blktrace.h blktrace_api.h rbtree.h list.h tracers.h

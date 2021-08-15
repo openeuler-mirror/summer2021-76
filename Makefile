@@ -13,7 +13,7 @@ all: $(ALL)
 %.o: %.c
 	$(CC) -o $*.o -c $(ALL_CFLAGS) $<
 
-ioheat: main.o tracers.o
+ioheat: main.o tracers.o rbtree.o blkparse.o blkparse_fmt.o # blktrace.o
 	$(CC) $(ALL_CFLAGS) -o $@ $(filter %.o,$^) -lm
 
 depend:
